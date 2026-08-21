@@ -13,7 +13,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='skywalker',
+    maintainer='rokey',
     maintainer_email='rokeydg1@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'demo_fms_node = fms.demo_fms_node:main',
+            'dummy_fms = fms.dummy_fms_node:main',
         ],
     },
 )
