@@ -1,4 +1,4 @@
-# Multi-AMR Digital Twin
+# cobot3_project
 
 혼류 생산 환경에서 Multi-AMR 기반 부품 공급을 구현하는
 ROS 2 / Isaac Sim / NVIDIA cuOpt Digital Twin 프로젝트입니다.
