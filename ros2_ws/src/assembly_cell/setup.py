@@ -13,7 +13,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='skywalker',
+    maintainer='rokey',
     maintainer_email='rokeydg1@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
@@ -25,6 +25,9 @@ setup(
     entry_points={
         'console_scripts': [
             'assembly_request_node = assembly_cell.assembly_request_node:main',
+            'assembly_node = assembly_cell.assembly_node:main',
+            'assembly_cell = assembly_cell.assembly_cell:main',
+            'task = assembly_cell.task:main',
         ],
     },
 )
