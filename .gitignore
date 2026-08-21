@@ -1,0 +1,40 @@
+# ROS2
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+venv/
+env/
+
+*.egg-info/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Isaac Sim / Cache
+.cache/
+simulation/isaac_sim/.cache/
+*.log
+
+# ROS Bag / Generated Data
+*.bag
+*.db3
+*.mcap
+
+# Temporary
+*.tmp
+*.temp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
