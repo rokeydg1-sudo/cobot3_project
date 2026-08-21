@@ -9,9 +9,9 @@ __pycache__/
 *.pyo
 *.pyd
 
-.venv/
-venv/
-env/
+/.venv/
+/venv/
+/env/
 
 *.egg-info/
 dist/
@@ -38,3 +38,6 @@ simulation/isaac_sim/.cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# Integration smoke test generated files
+/tests/integration/cuopt_fms_smoke/cuopt_route.json
