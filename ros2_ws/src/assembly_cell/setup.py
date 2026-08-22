@@ -24,10 +24,10 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'assembly_request_node = assembly_cell.assembly_request_node:main',
             'assembly_node = assembly_cell.assembly_node:main',
             'assembly_cell = assembly_cell.assembly_cell:main',
             'task = assembly_cell.task:main',
+            'area_detection_node = assembly_cell.area_detection_node:main'
         ],
     },
 )
