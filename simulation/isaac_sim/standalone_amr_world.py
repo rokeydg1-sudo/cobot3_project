@@ -1,5 +1,4 @@
 from isaacsim import SimulationApp
-import socket
 
 
 # =========================================================
@@ -443,31 +442,58 @@ world.reset()
 
 
 # =========================================================
-# 16. ROS2 Odometry OmniGraph 생성
+# 16. ROS2 OmniGraph
 #
-# Isaac Sim
-#   ↓
+# 명령:
+#
+# /amr/goal
+# geometry_msgs/msg/Point
+#       ↓
+# ROS2 Subscriber
+#       ↓
+# Nova Carter
+#
+#
+# 위치:
+#
+# Nova Carter
+#       ↓
 # IsaacComputeOdometry
-#   ↓
+#       ↓
 # ROS2PublishOdometry
-#   ↓
+#       ↓
 # /amr/odom
 #
-# TCP 5006 / amr_pose_bridge_node 필요 없음
+#
+# TCP 5005 / 5006 모두 제거
 # =========================================================
 
-ROS2_GRAPH_PATH = "/World/ROS2_AMR_Odom_Graph"
+ROS2_GRAPH_PATH = (
+    "/World/ROS2_AMR_Graph"
+)
 
-# 우선 AMR articulation root 자체를 chassisPrim으로 사용
-AMR_CHASSIS_PRIM = "/World/AMR/chassis_link"
+AMR_CHASSIS_PRIM = (
+    "/World/AMR/chassis_link"
+)
 
 
-stage = omni.usd.get_context().get_stage()
+stage = (
+    omni.usd
+    .get_context()
+    .get_stage()
+)
 
 
-# 기존 Graph가 있으면 제거
-if stage.GetPrimAtPath(
-    ROS2_GRAPH_PATH
+existing_graph = (
+    stage.GetPrimAtPath(
+        ROS2_GRAPH_PATH
+    )
+)
+
+
+if (
+    existing_graph
+    and existing_graph.IsValid()
 ):
 
     stage.RemovePrim(
@@ -477,6 +503,10 @@ if stage.GetPrimAtPath(
 
 keys = og.Controller.Keys
 
+
+# =========================================================
+# Graph 생성
+# =========================================================
 
 og.Controller.edit(
 
@@ -488,7 +518,7 @@ og.Controller.edit(
     {
 
         # =================================================
-        # OmniGraph Node 생성
+        # Node 생성
         # =================================================
 
         keys.CREATE_NODES: [
@@ -517,21 +547,27 @@ og.Controller.edit(
                 "PublishOdom",
                 "isaacsim.ros2.bridge.ROS2PublishOdometry",
             ),
+
+            (
+                "SubscribeGoal",
+                "isaacsim.ros2.bridge.ROS2Subscriber",
+            ),
         ],
 
 
         # =================================================
-        # Node 설정값
+        # 값 설정
         # =================================================
 
         keys.SET_VALUES: [
 
             # ---------------------------------------------
-            # 실제 Nova Carter 위치 계산 대상
+            # Odometry 대상
             # ---------------------------------------------
 
             (
                 "ComputeOdom.inputs:chassisPrim",
+
                 [
                     Sdf.Path(
                         AMR_CHASSIS_PRIM
@@ -541,18 +577,13 @@ og.Controller.edit(
 
 
             # ---------------------------------------------
-            # ROS2 Topic
+            # /amr/odom
             # ---------------------------------------------
 
             (
                 "PublishOdom.inputs:topicName",
                 "/amr/odom",
             ),
-
-
-            # ---------------------------------------------
-            # Frame
-            # ---------------------------------------------
 
             (
                 "PublishOdom.inputs:odomFrameId",
@@ -566,10 +597,34 @@ og.Controller.edit(
 
 
             # ---------------------------------------------
-            # ROS_DOMAIN_ID
+            # /amr/goal
             #
-            # True이면 실행 터미널의
-            # ROS_DOMAIN_ID 환경변수를 그대로 사용
+            # geometry_msgs/msg/Point
+            # ---------------------------------------------
+
+            (
+                "SubscribeGoal.inputs:topicName",
+                "/amr/goal",
+            ),
+
+            (
+                "SubscribeGoal.inputs:messagePackage",
+                "geometry_msgs",
+            ),
+
+            (
+                "SubscribeGoal.inputs:messageSubfolder",
+                "msg",
+            ),
+
+            (
+                "SubscribeGoal.inputs:messageName",
+                "Point",
+            ),
+
+
+            # ---------------------------------------------
+            # ROS_DOMAIN_ID 사용
             # ---------------------------------------------
 
             (
@@ -580,15 +635,13 @@ og.Controller.edit(
 
 
         # =================================================
-        # Node 연결
+        # 연결
         # =================================================
 
         keys.CONNECT: [
 
             # ---------------------------------------------
-            # Simulation Tick
-            # ↓
-            # Odometry 계산
+            # Tick -> Odometry
             # ---------------------------------------------
 
             (
@@ -596,167 +649,165 @@ og.Controller.edit(
                 "ComputeOdom.inputs:execIn",
             ),
 
-
-            # ---------------------------------------------
-            # 계산 완료
-            # ↓
-            # ROS2 Odometry Publish
-            # ---------------------------------------------
-
             (
                 "ComputeOdom.outputs:execOut",
                 "PublishOdom.inputs:execIn",
             ),
-
-
-            # ---------------------------------------------
-            # Position
-            # ---------------------------------------------
 
             (
                 "ComputeOdom.outputs:position",
                 "PublishOdom.inputs:position",
             ),
 
-
-            # ---------------------------------------------
-            # Orientation
-            # ---------------------------------------------
-
             (
                 "ComputeOdom.outputs:orientation",
                 "PublishOdom.inputs:orientation",
             ),
-
-
-            # ---------------------------------------------
-            # Linear Velocity
-            # ---------------------------------------------
 
             (
                 "ComputeOdom.outputs:linearVelocity",
                 "PublishOdom.inputs:linearVelocity",
             ),
 
-
-            # ---------------------------------------------
-            # Angular Velocity
-            # ---------------------------------------------
-
             (
                 "ComputeOdom.outputs:angularVelocity",
                 "PublishOdom.inputs:angularVelocity",
             ),
-
-
-            # ---------------------------------------------
-            # Simulation Time
-            # ---------------------------------------------
 
             (
                 "ReadSimTime.outputs:simulationTime",
                 "PublishOdom.inputs:timeStamp",
             ),
 
-
-            # ---------------------------------------------
-            # ROS2 Context
-            # ---------------------------------------------
-
             (
                 "Context.outputs:context",
                 "PublishOdom.inputs:context",
+            ),
+
+
+            # ---------------------------------------------
+            # Tick -> Goal Subscriber
+            # ---------------------------------------------
+
+            (
+                "OnPlaybackTick.outputs:tick",
+                "SubscribeGoal.inputs:execIn",
+            ),
+
+            (
+                "Context.outputs:context",
+                "SubscribeGoal.inputs:context",
             ),
         ],
     },
 )
 
 
+# =========================================================
+# Generic Subscriber는 message type 지정 후
+# x/y/z 출력 Attribute를 동적으로 생성함
+# =========================================================
+
+simulation_app.update()
+simulation_app.update()
+
+
+GOAL_NODE_PATH = (
+    ROS2_GRAPH_PATH
+    + "/SubscribeGoal"
+)
+
+
+goal_x_attr = (
+    og.Controller.attribute(
+
+        GOAL_NODE_PATH
+        + ".outputs:x"
+    )
+)
+
+
+goal_y_attr = (
+    og.Controller.attribute(
+
+        GOAL_NODE_PATH
+        + ".outputs:y"
+    )
+)
+
+
+goal_z_attr = (
+    og.Controller.attribute(
+
+        GOAL_NODE_PATH
+        + ".outputs:z"
+    )
+)
+
+
+if (
+
+    goal_x_attr is None
+
+    or not goal_x_attr.is_valid()
+
+    or goal_y_attr is None
+
+    or not goal_y_attr.is_valid()
+
+    or goal_z_attr is None
+
+    or not goal_z_attr.is_valid()
+):
+
+    raise RuntimeError(
+
+        "ROS2 Subscriber Point 출력 "
+        "x/y/z를 찾지 못했습니다."
+    )
+
+
 print("")
 print("=" * 60)
-print(" ROS2 ODOM GRAPH CREATED")
+print(" ROS2 AMR GRAPH CREATED")
 print("=" * 60)
-print(f"Graph       : {ROS2_GRAPH_PATH}")
-print(f"Chassis     : {AMR_CHASSIS_PRIM}")
-print("ROS2 Topic  : /amr/odom")
-print("TCP 5006    : REMOVED")
-print("Pose Bridge : NOT REQUIRED")
+
+print(
+    f"Graph       : "
+    f"{ROS2_GRAPH_PATH}"
+)
+
+print(
+    f"Chassis     : "
+    f"{AMR_CHASSIS_PRIM}"
+)
+
+print(
+    "Goal Topic  : /amr/goal"
+)
+
+print(
+    "Goal Type   : geometry_msgs/msg/Point"
+)
+
+print(
+    "Odom Topic  : /amr/odom"
+)
+
+print(
+    "TCP 5005    : REMOVED"
+)
+
+print(
+    "TCP 5006    : REMOVED"
+)
+
 print("=" * 60)
 print("")
 
 
 # =========================================================
-# 17. AMR Mission 명령 TCP Server
-#
-# 이 부분은 아직 그대로 유지
-#
-# ROS2 amr_mission_node
-#       ↓
-# TCP 5005
-#       ↓
-# Isaac Sim
-# =========================================================
-
-HOST = "127.0.0.1"
-PORT = 5005
-
-
-server_socket = socket.socket(
-    socket.AF_INET,
-    socket.SOCK_STREAM,
-)
-
-
-server_socket.setsockopt(
-    socket.SOL_SOCKET,
-    socket.SO_REUSEADDR,
-    1,
-)
-
-
-server_socket.bind(
-    (HOST, PORT)
-)
-
-
-server_socket.listen(5)
-
-
-# Simulation Loop 방해하지 않도록 non-blocking
-server_socket.setblocking(False)
-
-
-client_sockets = []
-
-
-print("")
-print("=" * 60)
-print(" AMR COMMAND SERVER")
-print("=" * 60)
-print(f"Listening : {HOST}:{PORT}")
-print("")
-print("Target Coordinates")
-print(
-    f"Supermarket : "
-    f"{LOCATIONS['supermarket'][:2]}"
-)
-print(
-    f"Cell A      : "
-    f"{LOCATIONS['cell_a'][:2]}"
-)
-print(
-    f"Cell B      : "
-    f"{LOCATIONS['cell_b'][:2]}"
-)
-print(
-    f"Cell C      : "
-    f"{LOCATIONS['cell_c'][:2]}"
-)
-print("=" * 60)
-
-
-# =========================================================
-# 18. 실제 DOF 이름 확인
+# 17. DOF 확인
 # =========================================================
 
 print("")
@@ -779,43 +830,51 @@ print("")
 
 
 # =========================================================
-# 19. Differential Controller
+# 18. Differential Controller
 # =========================================================
 
-differential_controller = DifferentialController(
+differential_controller = (
+    DifferentialController(
 
-    name="nova_carter_diff_controller",
+        name=(
+            "nova_carter_diff_controller"
+        ),
 
-    wheel_radius=0.145,
+        wheel_radius=0.145,
 
-    wheel_base=0.413,
+        wheel_base=0.413,
 
-    max_linear_speed=1.0,
+        max_linear_speed=1.0,
 
-    max_angular_speed=1.5,
+        max_angular_speed=1.5,
 
-    max_wheel_speed=10.0,
+        max_wheel_speed=10.0,
+    )
 )
 
 
 # =========================================================
-# 20. 목표 좌표 Controller
+# 19. Pose Controller
 # =========================================================
 
-pose_controller = WheelBasePoseController(
+pose_controller = (
+    WheelBasePoseController(
 
-    name="nova_carter_pose_controller",
+        name=(
+            "nova_carter_pose_controller"
+        ),
 
-    open_loop_wheel_controller=(
-        differential_controller
-    ),
+        open_loop_wheel_controller=(
+            differential_controller
+        ),
 
-    is_holonomic=False,
+        is_holonomic=False,
+    )
 )
 
 
 # =========================================================
-# 21. 시작 정보 출력
+# 20. 시작 정보
 # =========================================================
 
 print("")
@@ -823,465 +882,330 @@ print("=" * 60)
 print(" AMR STANDALONE WORLD")
 print("=" * 60)
 
-print("AMR STATUS   : IDLE")
-print("TARGET       : Waiting for external command")
+print(
+    "AMR STATUS   : IDLE"
+)
+
+print(
+    "TARGET       : Waiting for /amr/goal"
+)
 
 print("")
 
-print("Available coordinates:")
-
 print(
-    f"Supermarket  : "
-    f"{LOCATIONS['supermarket'][0]:.1f} "
-    f"{LOCATIONS['supermarket'][1]:.1f}"
+    "Communication"
 )
 
 print(
-    f"Cell A       : "
-    f"{LOCATIONS['cell_a'][0]:.1f} "
-    f"{LOCATIONS['cell_a'][1]:.1f}"
+    "Mission Command : "
+    "ROS2 Bridge <- /amr/goal"
 )
 
-print(
-    f"Cell B       : "
-    f"{LOCATIONS['cell_b'][0]:.1f} "
-    f"{LOCATIONS['cell_b'][1]:.1f}"
-)
-
-print(
-    f"Cell C       : "
-    f"{LOCATIONS['cell_c'][0]:.1f} "
-    f"{LOCATIONS['cell_c'][1]:.1f}"
-)
-
-print("=" * 60)
-
-print("")
-print("Communication")
-print(
-    f"Mission Command : TCP "
-    f"{HOST}:{PORT}"
-)
 print(
     "Pose Feedback   : "
     "ROS2 Bridge -> /amr/odom"
 )
+
 print("=" * 60)
 print("")
 
 
 # =========================================================
-# 22. 상태 변수
+# 21. 상태 변수
 # =========================================================
 
 TARGET_POSITION = None
 
 TARGET_NAME = None
 
-
 goal_reached = False
 
 print_counter = 0
 
 
-# 현재 Goal을 보낸 TCP Client
-active_client = None
+# /amr/goal Point.z의 command_id
+last_goal_command_id = 0
 
 
 # =========================================================
-# 23. Simulation Loop
+# 22. Simulation Loop
 # =========================================================
 
 while simulation_app.is_running():
 
 
     # =====================================================
-    # 1. 새로운 Mission TCP Client 연결 확인
+    # 1. /amr/goal 읽기
     # =====================================================
 
     try:
 
-        client_socket, client_address = (
-            server_socket.accept()
+        goal_x = float(
+
+            og.Controller.get(
+                goal_x_attr
+            )
         )
 
 
-        client_socket.setblocking(False)
+        goal_y = float(
 
-
-        client_sockets.append(
-            client_socket
+            og.Controller.get(
+                goal_y_attr
+            )
         )
 
+
+        goal_command_id = int(
+
+            round(
+
+                float(
+
+                    og.Controller.get(
+                        goal_z_attr
+                    )
+                )
+            )
+        )
+
+
+    except Exception as error:
 
         print(
-            f"[TCP] Client connected: "
-            f"{client_address}"
+
+            f"[ROS2 GOAL ERROR] "
+            f"{error}"
         )
 
 
-    except BlockingIOError:
-
-        pass
-
-
-    # =====================================================
-    # 2. Client가 보낸 Goal 좌표 확인
-    # =====================================================
-
-    for client_socket in client_sockets[:]:
-
-
-        try:
-
-            data = client_socket.recv(
-                1024
-            )
-
-
-            if not data:
-
-                client_socket.close()
-
-
-                if client_socket in client_sockets:
-
-                    client_sockets.remove(
-                        client_socket
-                    )
-
-
-                continue
-
-
-            command = (
-                data
-                .decode("utf-8")
-                .strip()
-            )
-
-
-            print(
-                f"[TCP] Received: {command}"
-            )
-
-
-            # ---------------------------------------------
-            # 입력:
-            #
-            # -7.0 0.0
-            #  7.0 3.5
-            # ---------------------------------------------
-
-            values = command.split()
-
-
-            if len(values) != 2:
-
-                client_socket.sendall(
-                    b"ERROR invalid command\n"
-                )
-
-                continue
-
-
-            goal_x = float(
-                values[0]
-            )
-
-            goal_y = float(
-                values[1]
-            )
-
-
-            TARGET_POSITION = np.array(
-                [
-                    goal_x,
-                    goal_y,
-                    0.0,
-                ],
-                dtype=np.float32,
-            )
-
-
-            TARGET_NAME = (
-                f"({goal_x:.2f}, "
-                f"{goal_y:.2f})"
-            )
-
-
-            active_client = client_socket
-
-
-            goal_reached = False
-
-
-            pose_controller.reset()
-
-
-            print("")
-            print("=" * 60)
-            print("NEW TARGET RECEIVED")
-            print("=" * 60)
-            print(f"X : {goal_x:.2f}")
-            print(f"Y : {goal_y:.2f}")
-            print("=" * 60)
-            print("")
-
-
-        except BlockingIOError:
-
-            pass
-
-
-        except ValueError:
-
-            print(
-                "[TCP] Invalid coordinates"
-            )
-
-
-            try:
-
-                client_socket.sendall(
-                    b"ERROR invalid coordinates\n"
-                )
-
-            except Exception:
-
-                pass
-
-
-        except Exception as error:
-
-            print(
-                f"[TCP ERROR] {error}"
-            )
-
-
-            try:
-
-                client_socket.close()
-
-            except Exception:
-
-                pass
-
-
-            if client_socket in client_sockets:
-
-                client_sockets.remove(
-                    client_socket
-                )
-
-
-            if active_client is client_socket:
-
-                active_client = None
-
-
-    # =====================================================
-    # 3. 현재 Nova Carter 실제 위치 / 방향
-    #
-    # 이 값은 AMR 이동 제어용으로 계속 사용
-    #
-    # ROS2 Publish는 OmniGraph가 직접 처리
-    # =====================================================
-
-    current_position, current_orientation = (
-        amr.get_world_pose()
-    )
-
-
-    # =====================================================
-    # 4. Goal 없으면 대기
-    # =====================================================
-
-    if TARGET_POSITION is None:
-
-        world.step(
-            render=True
-        )
-
-        continue
-
-
-    # =====================================================
-    # 5. 목표까지 거리 계산
-    # =====================================================
-
-    dx = (
-        TARGET_POSITION[0]
-        - current_position[0]
-    )
-
-
-    dy = (
-        TARGET_POSITION[1]
-        - current_position[1]
-    )
-
-
-    distance = math.sqrt(
-        dx * dx
-        + dy * dy
-    )
-
-
-    # =====================================================
-    # 6. 목표로 이동
-    # =====================================================
-
-    if not goal_reached:
-
-
-        action = pose_controller.forward(
-
-            start_position=(
-                current_position
-            ),
-
-            start_orientation=(
-                current_orientation
-            ),
-
-            goal_position=(
-                TARGET_POSITION
-            ),
-
-            lateral_velocity=0.6,
-
-            yaw_velocity=0.8,
-
-            heading_tol=0.05,
-
-            position_tol=0.20,
+        goal_command_id = (
+            last_goal_command_id
         )
 
 
-        amr.apply_wheel_actions(
-            action
+    # =====================================================
+    # 2. 새로운 Goal인지 확인
+    # =====================================================
+
+    if (
+
+        goal_command_id > 0
+
+        and goal_command_id
+        != last_goal_command_id
+    ):
+
+        last_goal_command_id = (
+            goal_command_id
+        )
+
+
+        TARGET_POSITION = np.array(
+
+            [
+                goal_x,
+                goal_y,
+                0.0,
+            ],
+
+            dtype=np.float32,
+        )
+
+
+        TARGET_NAME = (
+
+            f"({goal_x:.2f}, "
+            f"{goal_y:.2f})"
+        )
+
+
+        goal_reached = False
+
+
+        pose_controller.reset()
+
+
+        print("")
+        print("=" * 60)
+        print("NEW ROS2 TARGET RECEIVED")
+        print("=" * 60)
+
+        print(
+            f"Command ID : "
+            f"{goal_command_id}"
+        )
+
+        print(
+            f"X          : "
+            f"{goal_x:.2f}"
+        )
+
+        print(
+            f"Y          : "
+            f"{goal_y:.2f}"
+        )
+
+        print("=" * 60)
+        print("")
+
+
+    # =====================================================
+    # 3. 현재 위치
+    # =====================================================
+
+    (
+        current_position,
+        current_orientation,
+    ) = amr.get_world_pose()
+
+
+    # =====================================================
+    # 4. Goal 존재
+    # =====================================================
+
+    if TARGET_POSITION is not None:
+
+
+        dx = (
+
+            TARGET_POSITION[0]
+            - current_position[0]
+        )
+
+
+        dy = (
+
+            TARGET_POSITION[1]
+            - current_position[1]
+        )
+
+
+        distance = math.sqrt(
+
+            dx * dx
+            + dy * dy
         )
 
 
         # =================================================
-        # 7. 도착 판정
+        # 이동
         # =================================================
 
-        if distance < 0.20:
+        if not goal_reached:
 
 
-            goal_reached = True
+            action = (
+                pose_controller.forward(
+
+                    start_position=(
+                        current_position
+                    ),
+
+                    start_orientation=(
+                        current_orientation
+                    ),
+
+                    goal_position=(
+                        TARGET_POSITION
+                    ),
+
+                    lateral_velocity=0.6,
+
+                    yaw_velocity=0.8,
+
+                    heading_tol=0.05,
+
+                    position_tol=0.20,
+                )
+            )
 
 
             amr.apply_wheel_actions(
+                action
+            )
 
-                differential_controller.forward(
 
-                    command=np.array(
-                        [0.0, 0.0]
+            # =============================================
+            # Isaac 내부에서 로봇 정지
+            #
+            # Mission 성공 판정은
+            # AMR Mission Node가 /amr/odom으로 처리
+            # =============================================
+
+            if distance < 0.20:
+
+
+                goal_reached = True
+
+
+                amr.apply_wheel_actions(
+
+                    differential_controller.forward(
+
+                        command=np.array(
+                            [0.0, 0.0]
+                        )
                     )
                 )
-            )
 
 
-            print("")
-            print("=" * 60)
-            print("TARGET REACHED")
-            print("=" * 60)
+                print("")
+                print("=" * 60)
+                print("TARGET REACHED")
+                print("=" * 60)
+
+                print(
+                    f"x="
+                    f"{current_position[0]:.2f}"
+                )
+
+                print(
+                    f"y="
+                    f"{current_position[1]:.2f}"
+                )
+
+                print("=" * 60)
+                print("")
+
+
+        # =================================================
+        # 위치 출력
+        # =================================================
+
+        print_counter += 1
+
+
+        if print_counter >= 30:
+
+
+            print_counter = 0
+
 
             print(
-                f"x={current_position[0]:.2f}"
+
+                f"[AMR] "
+
+                f"x="
+                f"{current_position[0]:6.2f} "
+
+                f"y="
+                f"{current_position[1]:6.2f} "
+
+                f"| target="
+                f"{TARGET_NAME} "
+
+                f"| distance="
+                f"{distance:5.2f}m"
             )
 
-            print(
-                f"y={current_position[1]:.2f}"
-            )
-
-            print("=" * 60)
-            print("")
-
-
-            # ---------------------------------------------
-            # Mission Node에 REACHED 응답
-            # ---------------------------------------------
-
-            if active_client is not None:
-
-
-                try:
-
-                    active_client.sendall(
-                        b"REACHED\n"
-                    )
-
-
-                    print(
-                        "[TCP] Sent: REACHED"
-                    )
-
-
-                    active_client.close()
-
-
-                    if (
-                        active_client
-                        in client_sockets
-                    ):
-
-                        client_sockets.remove(
-                            active_client
-                        )
-
-
-                except Exception as error:
-
-                    print(
-                        f"[TCP] "
-                        f"REACHED send error: "
-                        f"{error}"
-                    )
-
-
-                active_client = None
-
 
     # =====================================================
-    # 8. 위치 출력
-    # =====================================================
-
-    print_counter += 1
-
-
-    if print_counter >= 30:
-
-
-        print_counter = 0
-
-
-        print(
-
-            f"[AMR] "
-
-            f"x="
-            f"{current_position[0]:6.2f} "
-
-            f"y="
-            f"{current_position[1]:6.2f} "
-
-            f"| target="
-            f"{TARGET_NAME} "
-
-            f"| distance="
-            f"{distance:5.2f}m"
-        )
-
-
-    # =====================================================
-    # 9. Simulation Step
+    # 5. Simulation Step
     #
-    # OnPlaybackTick가 여기서 실행되면서
-    # /amr/odom이 자동 Publish됨
+    # 여기서
+    # - /amr/goal 구독
+    # - /amr/odom 발행
     # =====================================================
 
     world.step(
@@ -1290,21 +1214,7 @@ while simulation_app.is_running():
 
 
 # =========================================================
-# 24. 종료
+# 23. 종료
 # =========================================================
-
-for client_socket in client_sockets:
-
-    try:
-
-        client_socket.close()
-
-    except Exception:
-
-        pass
-
-
-server_socket.close()
-
 
 simulation_app.close()
