@@ -25,7 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'amr_mission_node = amr_control.amr_mission_node:main',
-            'amr_pose_bridge_node = amr_control.amr_pose_bridge_node:main',
+        
         ],
     },
 )
