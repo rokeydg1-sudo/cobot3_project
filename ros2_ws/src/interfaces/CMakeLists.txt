@@ -5,7 +5,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/ExecuteMission.action"
+  "srv/RequestTask.srv"
 )
 
 ament_export_dependencies(rosidl_default_runtime)

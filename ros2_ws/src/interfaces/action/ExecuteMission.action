@@ -1,6 +1,0 @@
-string[] route
----
-bool success
-string message
----
-string status

@@ -1,0 +1,18 @@
+string amr_id
+string state
+string current_task_id
+float64 x
+float64 y
+string load_state
+---
+bool has_task
+string task_id
+string kit_id
+float64 processing_time
+string pickup_id
+float64 pickup_x
+float64 pickup_y
+string delivery_id
+float64 delivery_x
+float64 delivery_y
+string message
