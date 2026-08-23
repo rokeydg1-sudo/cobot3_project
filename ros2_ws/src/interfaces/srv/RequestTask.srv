@@ -1,3 +1,4 @@
+# An IDLE AMR reports its current runtime state and asks FMS for work.
 string amr_id
 string state
 string current_task_id
@@ -5,6 +6,7 @@ float64 x
 float64 y
 string load_state
 ---
+# FMS returns physical mission points. It does not return a Nav2 path.
 bool has_task
 string task_id
 string kit_id

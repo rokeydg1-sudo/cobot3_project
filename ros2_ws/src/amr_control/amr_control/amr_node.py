@@ -5,13 +5,16 @@ import time
 import rclpy
 
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from geometry_msgs.msg import Point
-from nav_msgs.msg import Odometry
-from std_msgs.msg import String
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.action import ComputePathToPose
+from nav_msgs.msg import Odometry, Path
 
+from interfaces.msg import AMRStatus
 from interfaces.srv import RequestTask
 
 
@@ -22,6 +25,9 @@ from interfaces.srv import RequestTask
 ARRIVAL_TOLERANCE_M = 0.20
 MOVE_TIMEOUT_SEC = 60.0
 CHECK_INTERVAL_SEC = 0.05
+NAV2_SERVER_TIMEOUT_SEC = 10.0
+NAV2_RESULT_TIMEOUT_SEC = 30.0
+GLOBAL_FRAME_ID = "map"
 
 # FMS에 다음 작업을 요청하는 주기
 TASK_REQUEST_INTERVAL_SEC = 1.0
@@ -80,6 +86,7 @@ class AMRNode(Node):
         self.odom_group = MutuallyExclusiveCallbackGroup()
         self.service_group = MutuallyExclusiveCallbackGroup()
         self.timer_group = MutuallyExclusiveCallbackGroup()
+        self.nav2_group = MutuallyExclusiveCallbackGroup()
 
 
         # =================================================
@@ -104,10 +111,19 @@ class AMRNode(Node):
         # 향후 Nav2 NavigateToPose로 교체 예정
         # =================================================
 
-        self.goal_publisher = self.create_publisher(
-            Point,
-            "/amr/goal",
+        self.path_command_publisher = self.create_publisher(
+            Path,
+            "/amr/path_command",
             10,
+        )
+
+        # Nav2 planner는 FMS가 준 목적지까지의 중간 경로만 계산한다.
+        # 계산된 Path는 Isaac Sim 측 주행 제어기가 소비한다.
+        self.path_client = ActionClient(
+            self,
+            ComputePathToPose,
+            "/compute_path_to_pose",
+            callback_group=self.nav2_group,
         )
 
 
@@ -133,7 +149,7 @@ class AMRNode(Node):
         # =================================================
 
         self.status_publisher = self.create_publisher(
-            String,
+            AMRStatus,
             "/amr/status",
             10,
         )
@@ -145,6 +161,7 @@ class AMRNode(Node):
 
         self.pose_lock = threading.Lock()
         self.latest_xy = None
+        self.isaac_state_received = False
 
 
         # =================================================
@@ -152,14 +169,6 @@ class AMRNode(Node):
         # =================================================
 
         self.task_lock = threading.Lock()
-
-
-        # =================================================
-        # 같은 좌표가 연속 Goal이어도
-        # Isaac이 새 명령으로 인식하도록 하는 ID
-        # =================================================
-
-        self.goal_command_id = 0
 
 
         # =================================================
@@ -194,7 +203,7 @@ class AMRNode(Node):
         )
 
         self.get_logger().info(
-            "Goal Topic    : /amr/goal"
+            "Path Command  : /amr/path_command"
         )
 
         self.get_logger().info(
@@ -214,10 +223,7 @@ class AMRNode(Node):
         )
 
 
-        # 최초 상태 알림
-        self.publish_status(
-            "READY"
-        )
+        # 최초 상태는 Isaac Sim의 odometry를 받은 뒤 알린다.
 
 
     # =====================================================
@@ -235,12 +241,27 @@ class AMRNode(Node):
         )
 
 
+        first_state = False
+
         with self.pose_lock:
 
             self.latest_xy = (
                 x,
                 y,
             )
+
+            if not self.isaac_state_received:
+
+                self.isaac_state_received = True
+                first_state = True
+
+        if first_state:
+
+            self.get_logger().info(
+                "Isaac Sim state received; AMR communication is ready"
+            )
+
+            self.publish_status("READY")
 
 
     # =====================================================
@@ -275,15 +296,19 @@ class AMRNode(Node):
         status,
     ):
 
-        msg = String()
+        msg = AMRStatus()
+        msg.amr_id = self.amr_id
+        msg.state = self.state
+        msg.event = status
+        msg.task_id = self.current_task_id
+        msg.kit_id = self.current_kit_id
+        msg.load_state = self.load_state
 
-        msg.data = (
-            f"amr_id={self.amr_id},"
-            f"state={self.state},"
-            f"status={status},"
-            f"task_id={self.current_task_id},"
-            f"load_state={self.load_state}"
-        )
+        current_position = self.get_current_position()
+
+        if current_position is not None:
+
+            msg.x, msg.y = current_position
 
 
         self.status_publisher.publish(
@@ -299,6 +324,17 @@ class AMRNode(Node):
             f"task_id={self.current_task_id or '-'}, "
             f"load={self.load_state}"
         )
+
+
+    def transition_to(self, state, event=None):
+
+        """Change runtime state and publish one state-change event."""
+
+        with self.task_lock:
+
+            self.state = state
+
+        self.publish_status(event or state)
 
 
     # =====================================================
@@ -585,9 +621,7 @@ class AMRNode(Node):
             # 1. Pickup 위치로 이동
             # =================================================
 
-            self.publish_status(
-                "MOVING_TO_PICKUP"
-            )
+            self.transition_to("MOVING_TO_PICKUP")
 
 
             pickup_success = (
@@ -616,9 +650,7 @@ class AMRNode(Node):
             # Pickup 도착
             # =================================================
 
-            self.publish_status(
-                "ARRIVED_PICKUP"
-            )
+            self.transition_to("ARRIVED_PICKUP")
 
 
             # =================================================
@@ -628,9 +660,7 @@ class AMRNode(Node):
             # 시간으로 가정
             # =================================================
 
-            self.publish_status(
-                "LOADING"
-            )
+            self.publish_status("LOADING")
 
 
             time.sleep(
@@ -640,19 +670,14 @@ class AMRNode(Node):
 
             self.load_state = "LOADED"
 
-
-            self.publish_status(
-                "LOAD_COMPLETE"
-            )
+            self.transition_to("LOADED", "LOAD_COMPLETE")
 
 
             # =================================================
             # 3. Delivery 위치로 이동
             # =================================================
 
-            self.publish_status(
-                "MOVING_TO_DELIVERY"
-            )
+            self.transition_to("MOVING_TO_DELIVERY")
 
 
             delivery_success = (
@@ -681,9 +706,7 @@ class AMRNode(Node):
             # Delivery 도착
             # =================================================
 
-            self.publish_status(
-                "ARRIVED_DELIVERY"
-            )
+            self.publish_status("ARRIVED_DELIVERY")
 
 
             # =================================================
@@ -695,19 +718,14 @@ class AMRNode(Node):
 
             self.load_state = "EMPTY"
 
-
-            self.publish_status(
-                "DELIVERY_COMPLETE"
-            )
+            self.transition_to("DELIVERED", "DELIVERY_COMPLETE")
 
 
             # =================================================
             # 5. Mission 완료
             # =================================================
 
-            self.publish_status(
-                "MISSION_COMPLETE"
-            )
+            self.publish_status("MISSION_COMPLETE")
 
 
             self.get_logger().info(
@@ -733,9 +751,7 @@ class AMRNode(Node):
                 self.task_running = False
 
 
-            self.publish_status(
-                "IDLE"
-            )
+            self.publish_status("IDLE")
 
 
         except Exception as error:
@@ -773,49 +789,124 @@ class AMRNode(Node):
 
 
     # =====================================================
-    # Isaac Sim으로 Goal 발행
-    #
-    # 현재는 /amr/goal 방식
-    # 향후 Nav2 NavigateToPose로 교체 예정
+    # Nav2에 경로를 요청하고 Isaac Sim에 Path 명령 발행
     # =====================================================
 
-    def publish_goal(
+    def plan_path(
         self,
         goal_x,
         goal_y,
     ):
 
-        self.goal_command_id += 1
+        current_position = self.get_current_position()
+
+        if current_position is None:
+
+            self.get_logger().error("Cannot plan without Isaac odometry")
+            return None
+
+        if not self.path_client.wait_for_server(
+            timeout_sec=NAV2_SERVER_TIMEOUT_SEC
+        ):
+
+            self.get_logger().error("Nav2 planner action server is unavailable")
+            return None
+
+        current_x, current_y = current_position
+        stamp = self.get_clock().now().to_msg()
+
+        goal = ComputePathToPose.Goal()
+        goal.use_start = True
+        goal.start = PoseStamped()
+        goal.start.header.frame_id = GLOBAL_FRAME_ID
+        goal.start.header.stamp = stamp
+        goal.start.pose.position.x = float(current_x)
+        goal.start.pose.position.y = float(current_y)
+        goal.start.pose.orientation.w = 1.0
+        goal.goal = PoseStamped()
+        goal.goal.header.frame_id = GLOBAL_FRAME_ID
+        goal.goal.header.stamp = stamp
+        goal.goal.pose.position.x = float(goal_x)
+        goal.goal.pose.position.y = float(goal_y)
+        goal.goal.pose.orientation.w = 1.0
+
+        completed = threading.Event()
+        outcome = {}
+
+        def result_callback(future):
+
+            try:
+
+                wrapped_result = future.result()
+                outcome["status"] = wrapped_result.status
+                outcome["result"] = wrapped_result.result
+
+            except Exception as error:
+
+                outcome["error"] = error
+
+            completed.set()
+
+        def goal_callback(future):
+
+            try:
+
+                goal_handle = future.result()
+
+                if not goal_handle.accepted:
+
+                    outcome["error"] = RuntimeError(
+                        "Nav2 rejected the path-planning request"
+                    )
+                    completed.set()
+                    return
+
+                goal_handle.get_result_async().add_done_callback(
+                    result_callback
+                )
+
+            except Exception as error:
+
+                outcome["error"] = error
+                completed.set()
+
+        self.path_client.send_goal_async(goal).add_done_callback(goal_callback)
+
+        if not completed.wait(NAV2_RESULT_TIMEOUT_SEC):
+
+            self.get_logger().error("Timed out while waiting for a Nav2 path")
+            return None
+
+        if "error" in outcome:
+
+            self.get_logger().error(f"Nav2 path request failed: {outcome['error']}")
+            return None
+
+        result = outcome["result"]
+
+        if outcome["status"] != GoalStatus.STATUS_SUCCEEDED:
+
+            self.get_logger().error(
+                f"Nav2 planning failed: code={result.error_code}, "
+                f"message={result.error_msg}"
+            )
+            return None
+
+        if not result.path.poses:
+
+            self.get_logger().error("Nav2 returned an empty path")
+            return None
+
+        return result.path
 
 
-        msg = Point()
+    def send_path_to_isaac(self, path):
 
-        msg.x = float(
-            goal_x
-        )
+        """Publish a Nav2-planned path for the Isaac Sim AMR controller."""
 
-        msg.y = float(
-            goal_y
-        )
-
-
-        # 지금은 z를 높이로 사용하지 않으므로
-        # command_id 용도로 사용
-        msg.z = float(
-            self.goal_command_id
-        )
-
-
-        self.goal_publisher.publish(
-            msg
-        )
-
-
+        self.path_command_publisher.publish(path)
         self.get_logger().info(
-            f"Goal published: "
-            f"x={goal_x:.2f}, "
-            f"y={goal_y:.2f}, "
-            f"id={self.goal_command_id}"
+            f"Path command sent to Isaac Sim: {len(path.poses)} poses"
         )
 
 
@@ -836,10 +927,16 @@ class AMRNode(Node):
         goal_y,
     ):
 
-        self.publish_goal(
+        path = self.plan_path(
             goal_x,
             goal_y,
         )
+
+        if path is None:
+
+            return False
+
+        self.send_path_to_isaac(path)
 
 
         start_time = (
@@ -850,10 +947,7 @@ class AMRNode(Node):
 
 
         # =================================================
-        # 현재는 /amr/odom 기반 도착 판정
-        #
-        # Nav2 도입 후에는
-        # NavigateToPose Action Result 기반으로 교체 예정
+        # Isaac Sim odometry를 기준으로 실제 도착을 확인한다.
         # =================================================
 
         while rclpy.ok():
