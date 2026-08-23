@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Sequence
 
 import rclpy
@@ -12,6 +13,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from interfaces.msg import AMRStatus
 from interfaces.srv import RequestTask
 
 from fms.defined import (
@@ -24,6 +26,19 @@ from fms.defined import (
 )
 
 from fms.scenario0_cuopt_solver import CuOptSolver
+
+
+@dataclass
+class AMRRuntimeState:
+    """Latest runtime state for one registered AMR."""
+
+    state: str
+    status: str
+    current_task_id: str
+    load_state: str
+    kit_id: str = ""
+    x: float = 0.0
+    y: float = 0.0
 
 
 class Scenario0FMSNode(Node):
@@ -61,6 +76,9 @@ class Scenario0FMSNode(Node):
             maxlen=self.QUEUE_CAPACITY
         )
 
+        # All Scenario 0 task times use FMS startup as time zero.
+        self.fms_started_at = time.monotonic()
+
 
         # =================================================
         # 마지막 최적화 결과
@@ -93,10 +111,7 @@ class Scenario0FMSNode(Node):
         # 상태 이벤트가 들어올 때만 갱신
         # =================================================
 
-        self.amr_states: dict[
-            str,
-            dict[str, str],
-        ] = {}
+        self.amr_states: dict[str, AMRRuntimeState] = {}
 
 
         # =================================================
@@ -121,7 +136,7 @@ class Scenario0FMSNode(Node):
 
         self.amr_status_subscription = (
             self.create_subscription(
-                String,
+                AMRStatus,
                 self.AMR_STATUS_TOPIC,
                 self.amr_status_callback,
                 10,
@@ -232,9 +247,9 @@ class Scenario0FMSNode(Node):
     # shape=STAR,
     # processing_time=3.0
     #
-    # 현재 Assembly에는 아직
-    # urgency / requested_at / deadline이 없으므로
-    # Scenario 0 기본값을 임시 적용
+    # 현재 Assembly에는 아직 urgency / deadline이 없으므로
+    # Scenario 0 기본값을 임시 적용한다.
+    # requested_at은 메시지 값이 아니라 FMS 수신 시각을 사용한다.
     #
     # 향후 custom interface에서 실제 값으로 교체
     # =====================================================
@@ -304,11 +319,8 @@ class Scenario0FMSNode(Node):
             # =============================================
             # Scenario 0 임시 metadata
             #
-            # 현재 Assembly 메시지에는 아직
-            # 아래 값들이 없음.
-            #
-            # 추후 Assembly/FMS custom message에서
-            # 실제 값으로 전달하도록 변경 예정.
+            # requested_at은 FMS 시작 시각을 0으로 한 작업 수신 시각이다.
+            # urgency/deadline은 custom message 적용 전까지 기본값을 쓴다.
             # =============================================
 
             urgency = int(
@@ -319,12 +331,7 @@ class Scenario0FMSNode(Node):
             )
 
 
-            requested_at = int(
-                fields.get(
-                    "requested_at",
-                    int(time.monotonic()),
-                )
-            )
+            requested_at = int(time.monotonic() - self.fms_started_at)
 
 
             deadline = int(
@@ -464,82 +471,51 @@ class Scenario0FMSNode(Node):
     # =====================================================
     # AMR 상태 Event 수신
     #
-    # 예:
-    #
-    # amr_id=AMR_01,
-    # state=BUSY,
-    # status=MOVING_TO_DELIVERY,
-    # task_id=17,
-    # load_state=LOADED
-    #
     # polling하지 않고
     # Event가 들어올 때만 마지막 상태 갱신
     # =====================================================
 
     def amr_status_callback(
         self,
-        message: String,
+        message: AMRStatus,
     ) -> None:
 
-        fields = (
-            self.parse_key_value_message(
-                message.data
-            )
-        )
-
-
-        amr_id = fields.get(
-            "amr_id"
-        )
+        amr_id = message.amr_id
 
 
         if not amr_id:
 
             self.get_logger().warning(
                 f"Invalid AMR status: "
-                f"{message.data}"
+                "amr_id is empty"
             )
 
             return
 
 
-        self.amr_states[
-            amr_id
-        ] = {
-
-            "state": fields.get(
-                "state",
-                "",
-            ),
-
-            "status": fields.get(
-                "status",
-                "",
-            ),
-
-            "current_task_id": fields.get(
-                "task_id",
-                "",
-            ),
-
-            "load_state": fields.get(
-                "load_state",
-                "",
-            ),
-        }
+        self.amr_states[amr_id] = AMRRuntimeState(
+            state=message.state,
+            status=message.event,
+            current_task_id=message.task_id,
+            load_state=message.load_state,
+            kit_id=message.kit_id,
+            x=float(message.x),
+            y=float(message.y),
+        )
 
 
         self.get_logger().info(
             f"[AMR EVENT] "
             f"{amr_id} "
             f"state="
-            f"{self.amr_states[amr_id]['state']} "
+            f"{self.amr_states[amr_id].state} "
             f"status="
-            f"{self.amr_states[amr_id]['status']} "
+            f"{self.amr_states[amr_id].status} "
             f"task="
-            f"{self.amr_states[amr_id]['current_task_id'] or '-'} "
+            f"{self.amr_states[amr_id].current_task_id or '-'} "
             f"load="
-            f"{self.amr_states[amr_id]['load_state']}"
+            f"{self.amr_states[amr_id].load_state} "
+            f"position=({message.x:.2f}, {message.y:.2f})"
         )
 
 
@@ -568,31 +544,51 @@ class Scenario0FMSNode(Node):
             f"{request.load_state}"
         )
 
+        if not request.amr_id:
+            response.has_task = False
+            response.message = "Rejected: amr_id is empty."
+            return response
+
+        if request.state != "IDLE":
+            response.has_task = False
+            response.message = "Rejected: AMR state must be IDLE."
+            return response
+
+        if request.current_task_id:
+            response.has_task = False
+            response.message = "Rejected: AMR already has a task."
+            return response
+
+        if request.load_state != "EMPTY":
+            response.has_task = False
+            response.message = "Rejected: AMR load state must be EMPTY."
+            return response
+
+        stored_state = self.amr_states.get(request.amr_id)
+        if stored_state is not None and stored_state.state not in {
+            "IDLE",
+            "DELIVERED",
+        }:
+            response.has_task = False
+            response.message = (
+                "Rejected: FMS records AMR as "
+                f"{stored_state.state}."
+            )
+            return response
+
 
         # =================================================
         # Request 자체를 AMR 최신 상태로 반영
         # =================================================
 
-        self.amr_states[
-            request.amr_id
-        ] = {
-
-            "state": (
-                request.state
-            ),
-
-            "status": (
-                "REQUESTING_TASK"
-            ),
-
-            "current_task_id": (
-                request.current_task_id
-            ),
-
-            "load_state": (
-                request.load_state
-            ),
-        }
+        self.amr_states[request.amr_id] = AMRRuntimeState(
+            state=request.state,
+            status="REQUESTING_TASK",
+            current_task_id=request.current_task_id,
+            load_state=request.load_state,
+            x=float(request.x),
+            y=float(request.y),
+        )
 
 
         # =================================================
@@ -893,24 +889,15 @@ class Scenario0FMSNode(Node):
             # FMS AMR 상태 갱신
             # =============================================
 
-            self.amr_states[
-                request.amr_id
-            ] = {
-
-                "state": "BUSY",
-
-                "status": (
-                    "TASK_ASSIGNED"
-                ),
-
-                "current_task_id": (
-                    selected_task.task_id
-                ),
-
-                "load_state": (
-                    request.load_state
-                ),
-            }
+            self.amr_states[request.amr_id] = AMRRuntimeState(
+                state="BUSY",
+                status="TASK_ASSIGNED",
+                current_task_id=selected_task.task_id,
+                load_state=request.load_state,
+                kit_id=selected_task.kit_id,
+                x=float(request.x),
+                y=float(request.y),
+            )
 
 
             self.get_logger().info(

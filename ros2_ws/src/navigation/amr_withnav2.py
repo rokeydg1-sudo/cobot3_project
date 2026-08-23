@@ -20,18 +20,17 @@ NAV2_FRAME_ID = "map"
 NAV2_SERVER_TIMEOUT_SEC = 10.0
 NAV2_RESULT_TIMEOUT_SEC = 120.0
 TASK_REQUEST_INTERVAL_SEC = 1.0
-STATUS_UPDATE_INTERVAL_SEC = 1.0
 LOADING_TIME_SEC = 2.0
 
 
-class AMRNode(Node):
+class AMRNav2Node(Node):
     """Pull FMS missions and execute them through Nav2 NavigateToPose."""
 
-    def __init__(self, amr_id):
-        super().__init__("amr_node")
+    def __init__(self):
+        super().__init__("amr_nav2_node")
         self.set_parameters([Parameter("use_sim_time", value=True)])
 
-        self.amr_id = amr_id
+        self.amr_id = "AMR_01"
         self.state = "IDLE"
         self.load_state = "EMPTY"
         self.current_task_id = ""
@@ -49,7 +48,7 @@ class AMRNode(Node):
         self.timer_group = MutuallyExclusiveCallbackGroup()
         self.nav2_group = MutuallyExclusiveCallbackGroup()
 
-        # AMR -> FMS
+        # 현재 Workspace의 AMR -> FMS Pull 인터페이스
         self.task_client = self.create_client(
             RequestTask,
             "/fms/request_task",
@@ -59,7 +58,7 @@ class AMRNode(Node):
             AMRStatus, "/amr/status", 10
         )
 
-        # Nav2 plans and drives the AMR by publishing /cmd_vel to Isaac Sim.
+        # 유지하는 Nav2 통신: NavigateToPose가 경로 계획과 주행을 담당한다.
         self.nav2_client = ActionClient(
             self,
             NavigateToPose,
@@ -80,25 +79,19 @@ class AMRNode(Node):
             self.try_request_task,
             callback_group=self.timer_group,
         )
-        self.status_update_timer = self.create_timer(
-            STATUS_UPDATE_INTERVAL_SEC,
-            self.publish_runtime_status,
-            callback_group=self.timer_group,
-        )
 
         self.get_logger().info("=================================")
-        self.get_logger().info("AMR Node started")
-        self.get_logger().info(f"AMR ID        : {self.amr_id}")
-        self.get_logger().info("Task Service  : /fms/request_task")
-        self.get_logger().info("Nav2 Action   : /navigate_to_pose")
-        self.get_logger().info("Odom Topic    : /amr/odom")
-        self.get_logger().info("Status Topic  : /amr/status")
+        self.get_logger().info("AMR Nav2 Node started")
+        self.get_logger().info(f"AMR ID       : {self.amr_id}")
+        self.get_logger().info("Task Service : /fms/request_task")
+        self.get_logger().info("Nav2 Action  : /navigate_to_pose")
+        self.get_logger().info("Odom Topic   : /amr/odom")
+        self.get_logger().info("Status Topic : /amr/status")
         self.get_logger().info("=================================")
 
-    def odom_callback(self, msg):
-        """Store Isaac Sim odometry and announce readiness once."""
-        x = float(msg.pose.pose.position.x)
-        y = float(msg.pose.pose.position.y)
+    def odom_callback(self, message):
+        x = float(message.pose.pose.position.x)
+        y = float(message.pose.pose.position.y)
         first_state = False
 
         with self.pose_lock:
@@ -118,7 +111,6 @@ class AMRNode(Node):
             return self.latest_xy
 
     def publish_status(self, event):
-        """Publish the latest AMR runtime state to FMS."""
         message = AMRStatus()
         message.amr_id = self.amr_id
         message.state = self.state
@@ -139,18 +131,11 @@ class AMRNode(Node):
         )
 
     def transition_to(self, state, event=None):
-        """Change state and publish one state-change event."""
         with self.task_lock:
             self.state = state
         self.publish_status(event or state)
 
-    def publish_runtime_status(self):
-        """Report the current Isaac pose while a mission is in progress."""
-        if self.isaac_state_received and self.task_running:
-            self.publish_status("POSITION_UPDATE")
-
     def try_request_task(self):
-        """Ask FMS for work when this AMR can accept a mission."""
         if self.task_running or self.task_request_pending:
             return
         if self.state != "IDLE":
@@ -181,7 +166,6 @@ class AMRNode(Node):
         future.add_done_callback(self.task_response_callback)
 
     def task_response_callback(self, future):
-        """Store an FMS assignment and start its mission worker."""
         self.task_request_pending = False
         try:
             response = future.result()
@@ -206,17 +190,14 @@ class AMRNode(Node):
 
         self.get_logger().info("=================================")
         self.get_logger().info("NEW TASK RECEIVED")
-        self.get_logger().info(f"Task ID         : {response.task_id}")
-        self.get_logger().info(f"Kit ID          : {response.kit_id}")
+        self.get_logger().info(f"Task ID  : {response.task_id}")
+        self.get_logger().info(f"Kit ID   : {response.kit_id}")
         self.get_logger().info(
-            f"Processing Time : {response.processing_time:.1f}s"
-        )
-        self.get_logger().info(
-            f"Pickup          : {response.pickup_id} "
+            f"Pickup   : {response.pickup_id} "
             f"({response.pickup_x:.2f}, {response.pickup_y:.2f})"
         )
         self.get_logger().info(
-            f"Delivery        : {response.delivery_id} "
+            f"Delivery : {response.delivery_id} "
             f"({response.delivery_x:.2f}, {response.delivery_y:.2f})"
         )
         self.get_logger().info("=================================")
@@ -227,7 +208,6 @@ class AMRNode(Node):
         ).start()
 
     def execute_task(self, task):
-        """Execute the assigned pickup and delivery mission."""
         try:
             self.transition_to("MOVING_TO_PICKUP")
             if not self.move_to_destination(
@@ -249,11 +229,10 @@ class AMRNode(Node):
                 self.handle_task_failure(f"Failed to move to {task.delivery_id}")
                 return
 
-            self.transition_to("ARRIVED_DELIVERY")
+            self.publish_status("ARRIVED_DELIVERY")
             self.load_state = "EMPTY"
             self.transition_to("DELIVERED", "DELIVERY_COMPLETE")
             self.publish_status("MISSION_COMPLETE")
-            self.get_logger().info(f"[TASK COMPLETE] {self.current_task_id}")
 
             with self.task_lock:
                 self.current_task_id = ""
@@ -265,25 +244,14 @@ class AMRNode(Node):
             self.handle_task_failure(str(error))
 
     def handle_task_failure(self, message):
-        """Move the AMR to ERROR and stop automatic task requests."""
         with self.task_lock:
             self.state = "ERROR"
             self.task_running = False
         self.publish_status("TASK_FAILED")
         self.get_logger().error(f"[TASK FAILED] {message}")
 
-    def create_pose(self, x, y):
-        """Create a map-frame pose for a Nav2 navigation goal."""
-        pose = PoseStamped()
-        pose.header.frame_id = NAV2_FRAME_ID
-        pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = float(x)
-        pose.pose.position.y = float(y)
-        pose.pose.orientation.w = 1.0
-        return pose
-
     def move_to_destination(self, destination_id, goal_x, goal_y):
-        """Send one FMS destination to Nav2 and wait for its result."""
+        """Send one physical FMS destination to Nav2 and await its result."""
         if not self.nav2_client.wait_for_server(
             timeout_sec=NAV2_SERVER_TIMEOUT_SEC
         ):
@@ -357,11 +325,19 @@ class AMRNode(Node):
         self.get_logger().info(f"Nav2 reached destination: {destination_id}")
         return True
 
+    def create_pose(self, x, y):
+        pose = PoseStamped()
+        pose.header.frame_id = NAV2_FRAME_ID
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = float(x)
+        pose.pose.position.y = float(y)
+        pose.pose.orientation.w = 1.0
+        return pose
+
 
 def main(args=None):
     rclpy.init(args=args)
-    amr_id = "AMR_01"
-    node = AMRNode(amr_id)
+    node = AMRNav2Node()
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
 

@@ -1,3 +1,28 @@
+import os
+import sys
+from pathlib import Path
+
+
+# Isaac Sim ROS 2 Bridge의 내장 Jazzy 라이브러리는 프로세스 시작 전에
+# LD_LIBRARY_PATH에 있어야 한다. 누락된 경우 환경을 보정해 한 번 재실행한다.
+ISAAC_SIM_ROOT = Path(sys.executable).resolve().parents[3]
+ROS_DISTRO = os.environ.get("ROS_DISTRO", "jazzy")
+ROS2_LIB_PATH = ISAAC_SIM_ROOT / "exts" / "isaacsim.ros2.core" / ROS_DISTRO / "lib"
+
+if not ROS2_LIB_PATH.is_dir():
+    raise RuntimeError(f"Isaac Sim ROS 2 libraries not found: {ROS2_LIB_PATH}")
+
+library_paths = os.environ.get("LD_LIBRARY_PATH", "").split(":")
+if str(ROS2_LIB_PATH) not in library_paths:
+    environment = os.environ.copy()
+    environment["ROS_DISTRO"] = ROS_DISTRO
+    environment.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
+    environment["LD_LIBRARY_PATH"] = ":".join(
+        [str(ROS2_LIB_PATH), *filter(None, library_paths)]
+    )
+    os.execve(sys.executable, [sys.executable, *sys.argv], environment)
+
+
 from isaacsim import SimulationApp
 
 
@@ -17,6 +42,7 @@ simulation_app = SimulationApp({
 import math
 import numpy as np
 import omni.graph.core as og
+import omni.kit.app
 import omni.usd
 
 from pxr import Sdf
@@ -43,19 +69,43 @@ from isaacsim.storage.native import get_assets_root_path
 # 2. ROS2 Bridge Extension 활성화
 # =========================================================
 
-enable_extension(
-    "isaacsim.ros2.bridge"
+ROS2_EXTENSIONS = (
+    "isaacsim.ros2.core",
+    "isaacsim.ros2.nodes",
+    "isaacsim.ros2.bridge",
 )
 
-# Extension 로딩 반영
-simulation_app.update()
+for extension_id in ROS2_EXTENSIONS:
+    enable_extension(extension_id)
+
+# Extension과 OmniGraph node type 등록이 완료될 때까지 Kit를 갱신한다.
+extension_manager = omni.kit.app.get_app().get_extension_manager()
+for _ in range(30):
+    simulation_app.update()
+    if all(
+        extension_manager.is_extension_enabled(extension_id)
+        for extension_id in ROS2_EXTENSIONS
+    ):
+        break
+
+disabled_extensions = [
+    extension_id
+    for extension_id in ROS2_EXTENSIONS
+    if not extension_manager.is_extension_enabled(extension_id)
+]
+if disabled_extensions:
+    simulation_app.close()
+    raise RuntimeError(
+        "Failed to load required ROS 2 extensions: "
+        + ", ".join(disabled_extensions)
+    )
 
 
 print("")
 print("=" * 60)
 print(" ROS2 BRIDGE ENABLED")
 print("=" * 60)
-print("Extension : isaacsim.ros2.bridge")
+print("Extensions: " + ", ".join(ROS2_EXTENSIONS))
 print("=" * 60)
 print("")
 
