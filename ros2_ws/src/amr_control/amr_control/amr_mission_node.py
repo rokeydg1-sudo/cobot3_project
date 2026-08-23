@@ -1,11 +1,18 @@
+import math
+import threading
 import time
-import socket
 
 import rclpy
+
 from rclpy.node import Node
 from rclpy.action import ActionServer
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
+from geometry_msgs.msg import Point
+from nav_msgs.msg import Odometry
 from std_msgs.msg import String
+
 from interfaces.action import ExecuteMission
 
 
@@ -22,50 +29,129 @@ LOCATIONS = {
 
 
 # =========================================================
-# Isaac Sim TCP Server
+# 이동 설정
 # =========================================================
 
-ISAAC_HOST = "127.0.0.1"
-ISAAC_PORT = 5005
+ARRIVAL_TOLERANCE_M = 0.20
+MOVE_TIMEOUT_SEC = 60.0
+CHECK_INTERVAL_SEC = 0.05
 
 
 class AMRMissionNode(Node):
 
     def __init__(self):
-        super().__init__('amr_mission_node')
+
+        super().__init__("amr_mission_node")
+
+        # Action 실행 중에도 /amr/odom을 받아야 하므로
+        # Callback Group을 분리한다.
+        self.action_group = MutuallyExclusiveCallbackGroup()
+        self.odom_group = MutuallyExclusiveCallbackGroup()
+
 
         # =================================================
-        # FMS가 보내는 Mission을 받는 Action Server
+        # FMS -> AMR Mission
         # =================================================
 
         self.action_server = ActionServer(
             self,
             ExecuteMission,
-            '/amr/execute_mission',
-            self.execute_callback
+            "/amr/execute_mission",
+            self.execute_callback,
+            callback_group=self.action_group,
         )
 
+
         # =================================================
-        # AMR 상태 Publisher
+        # AMR Mission Node -> Isaac Sim
+        #
+        # TCP 5005 대신 ROS2 Topic
+        # =================================================
+
+        self.goal_publisher = self.create_publisher(
+            Point,
+            "/amr/goal",
+            10,
+        )
+
+
+        # =================================================
+        # Isaac Sim -> AMR Mission Node
+        #
+        # Isaac ROS2 Bridge가 발행
+        # =================================================
+
+        self.odom_subscription = self.create_subscription(
+            Odometry,
+            "/amr/odom",
+            self.odom_callback,
+            10,
+            callback_group=self.odom_group,
+        )
+
+
+        # =================================================
+        # AMR 상태
         # =================================================
 
         self.status_publisher = self.create_publisher(
             String,
-            '/amr/status',
-            10
+            "/amr/status",
+            10,
+        )
+
+
+        # 최신 AMR 좌표
+        self.pose_lock = threading.Lock()
+        self.latest_xy = None
+
+
+        # 같은 위치를 연속 명령해도
+        # Isaac이 새 명령인지 구분하기 위한 ID
+        self.goal_command_id = 0
+
+
+        self.get_logger().info(
+            "AMR Mission Action Server started"
         )
 
         self.get_logger().info(
-            'AMR Mission Action Server started'
+            "Goal command  : /amr/goal"
         )
 
         self.get_logger().info(
-            'Waiting for mission from FMS...'
+            "Pose feedback : /amr/odom"
+        )
+
+        self.get_logger().info(
+            "TCP 5005      : REMOVED"
         )
 
 
     # =====================================================
-    # AMR 상태 발행
+    # /amr/odom 수신
+    # =====================================================
+
+    def odom_callback(self, msg):
+
+        x = float(
+            msg.pose.pose.position.x
+        )
+
+        y = float(
+            msg.pose.pose.position.y
+        )
+
+        with self.pose_lock:
+
+            self.latest_xy = (
+                x,
+                y,
+            )
+
+
+    # =====================================================
+    # 상태 발행
     # =====================================================
 
     def publish_status(self, status):
@@ -73,156 +159,220 @@ class AMRMissionNode(Node):
         msg = String()
         msg.data = status
 
-        self.status_publisher.publish(msg)
+        self.status_publisher.publish(
+            msg
+        )
 
         self.get_logger().info(
-            f'STATUS: {status}'
+            f"STATUS: {status}"
         )
 
 
     # =====================================================
-    # Isaac Sim에 실제 이동 명령 전달
+    # Isaac Sim으로 Goal 발행
     # =====================================================
 
-    def move_to_destination(self, destination):
+    def publish_goal(
+        self,
+        goal_x,
+        goal_y,
+    ):
 
-        # ---------------------------------------------
-        # 목적지 확인
-        # ---------------------------------------------
+        self.goal_command_id += 1
+
+
+        msg = Point()
+
+        msg.x = float(
+            goal_x
+        )
+
+        msg.y = float(
+            goal_y
+        )
+
+
+        # 지금은 z를 실제 높이로 사용하지 않으므로
+        # 새 Goal을 구분하는 command_id로 사용
+        msg.z = float(
+            self.goal_command_id
+        )
+
+
+        self.goal_publisher.publish(
+            msg
+        )
+
+
+        self.get_logger().info(
+
+            f"Goal published: "
+            f"x={goal_x:.2f}, "
+            f"y={goal_y:.2f}, "
+            f"id={self.goal_command_id}"
+        )
+
+
+    # =====================================================
+    # 목적지 이동
+    # =====================================================
+
+    def move_to_destination(
+        self,
+        destination,
+    ):
 
         if destination not in LOCATIONS:
 
             self.get_logger().error(
-                f'Unknown destination: {destination}'
+                f"Unknown destination: {destination}"
             )
 
             return False
 
 
-        goal_x, goal_y = LOCATIONS[destination]
-
-        self.get_logger().info(
-            f'Sending Isaac goal: '
-            f'{destination} ({goal_x}, {goal_y})'
+        goal_x, goal_y = (
+            LOCATIONS[destination]
         )
 
 
-        # ---------------------------------------------
-        # Isaac Sim TCP 연결
-        # ---------------------------------------------
+        self.publish_goal(
+            goal_x,
+            goal_y,
+        )
 
-        try:
 
-            with socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM
-            ) as sock:
+        start_time = (
+            time.monotonic()
+        )
 
-                # 최대 60초 동안 이동 완료 기다림
-                sock.settimeout(60.0)
+        last_log_time = 0.0
 
-                sock.connect(
-                    (ISAAC_HOST, ISAAC_PORT)
+
+        # =================================================
+        # /amr/odom을 이용해 도착 판단
+        # =================================================
+
+        while rclpy.ok():
+
+            elapsed = (
+                time.monotonic()
+                - start_time
+            )
+
+
+            # ---------------------------------------------
+            # Timeout
+            # ---------------------------------------------
+
+            if elapsed >= MOVE_TIMEOUT_SEC:
+
+                self.get_logger().error(
+
+                    f"Timeout while moving "
+                    f"to {destination}"
+                )
+
+                return False
+
+
+            # ---------------------------------------------
+            # 최신 위치 확인
+            # ---------------------------------------------
+
+            with self.pose_lock:
+
+                latest_xy = (
+                    self.latest_xy
                 )
 
 
-                # 예:
-                # "-7.0 0.0"
-                command = (
-                    f'{goal_x} {goal_y}\n'
+            if latest_xy is None:
+
+                time.sleep(
+                    CHECK_INTERVAL_SEC
                 )
 
+                continue
 
-                sock.sendall(
-                    command.encode('utf-8')
+
+            current_x, current_y = (
+                latest_xy
+            )
+
+
+            # ---------------------------------------------
+            # 목표까지 거리
+            # ---------------------------------------------
+
+            distance = math.hypot(
+
+                goal_x - current_x,
+
+                goal_y - current_y,
+            )
+
+
+            # ---------------------------------------------
+            # 도착
+            # ---------------------------------------------
+
+            if (
+                distance
+                <= ARRIVAL_TOLERANCE_M
+            ):
+
+                self.get_logger().info(
+
+                    f"Reached {destination}: "
+                    f"x={current_x:.2f}, "
+                    f"y={current_y:.2f}, "
+                    f"distance={distance:.3f}m"
                 )
+
+                return True
+
+
+            # ---------------------------------------------
+            # 이동 중 로그
+            # ---------------------------------------------
+
+            now = time.monotonic()
+
+
+            if (
+                now - last_log_time
+                >= 1.0
+            ):
+
+                last_log_time = now
 
 
                 self.get_logger().info(
-                    f'Goal sent to Isaac Sim: '
-                    f'{command.strip()}'
+
+                    f"Moving {destination}: "
+                    f"x={current_x:.2f}, "
+                    f"y={current_y:.2f}, "
+                    f"distance={distance:.2f}m"
                 )
 
 
-                # =========================================
-                # Isaac Sim의 REACHED 응답 대기
-                # =========================================
-
-                while True:
-
-                    response = sock.recv(1024)
-
-                    if not response:
-
-                        self.get_logger().error(
-                            'Isaac Sim connection closed'
-                        )
-
-                        return False
-
-
-                    message = (
-                        response
-                        .decode('utf-8')
-                        .strip()
-                    )
-
-
-                    self.get_logger().info(
-                        f'Isaac response: {message}'
-                    )
-
-
-                    if message == 'REACHED':
-
-                        return True
-
-
-        # ---------------------------------------------
-        # Isaac Sim이 실행되지 않은 경우
-        # ---------------------------------------------
-
-        except ConnectionRefusedError:
-
-            self.get_logger().error(
-                'Cannot connect to Isaac Sim. '
-                'standalone_amr_world.py를 먼저 실행하세요.'
+            time.sleep(
+                CHECK_INTERVAL_SEC
             )
 
-            return False
 
-
-        # ---------------------------------------------
-        # 이동 시간이 너무 오래 걸린 경우
-        # ---------------------------------------------
-
-        except socket.timeout:
-
-            self.get_logger().error(
-                f'Timeout while moving to {destination}'
-            )
-
-            return False
-
-
-        # ---------------------------------------------
-        # 기타 TCP 오류
-        # ---------------------------------------------
-
-        except Exception as error:
-
-            self.get_logger().error(
-                f'Isaac TCP error: {error}'
-            )
-
-            return False
+        return False
 
 
     # =====================================================
-    # FMS Mission 수행
+    # Mission 수행
     # =====================================================
 
-    def execute_callback(self, goal_handle):
+    def execute_callback(
+        self,
+        goal_handle,
+    ):
 
         route = list(
             goal_handle.request.route
@@ -230,31 +380,42 @@ class AMRMissionNode(Node):
 
 
         self.get_logger().info(
-            f'Mission received: {" -> ".join(route)}'
+
+            f'Mission received: '
+            f'{" -> ".join(route)}'
         )
 
 
         self.publish_status(
-            'MISSION_RECEIVED'
+            "MISSION_RECEIVED"
         )
 
 
-        feedback_msg = ExecuteMission.Feedback()
+        feedback_msg = (
+            ExecuteMission.Feedback()
+        )
 
 
         # =================================================
-        # Mission 경로 순서대로 수행
+        # Route 순서대로 실행
         # =================================================
 
         for destination in route:
+
 
             # =============================================
             # 이동 시작
             # =============================================
 
-            status = f'MOVING_TO_{destination}'
+            status = (
+                f"MOVING_TO_{destination}"
+            )
 
-            self.publish_status(status)
+
+            self.publish_status(
+                status
+            )
+
 
             feedback_msg.status = status
 
@@ -264,27 +425,36 @@ class AMRMissionNode(Node):
 
 
             # =============================================
-            # 실제 Isaac Sim 이동
+            # 이동
             # =============================================
 
-            success = self.move_to_destination(
-                destination
+            success = (
+                self.move_to_destination(
+                    destination
+                )
             )
 
 
             # =============================================
-            # 이동 실패
+            # 실패
             # =============================================
 
             if not success:
 
                 status = (
-                    f'MOVE_FAILED_{destination}'
+                    f"MOVE_FAILED_{destination}"
                 )
 
-                self.publish_status(status)
 
-                feedback_msg.status = status
+                self.publish_status(
+                    status
+                )
+
+
+                feedback_msg.status = (
+                    status
+                )
+
 
                 goal_handle.publish_feedback(
                     feedback_msg
@@ -294,24 +464,35 @@ class AMRMissionNode(Node):
                 goal_handle.abort()
 
 
-                result = ExecuteMission.Result()
+                result = (
+                    ExecuteMission.Result()
+                )
+
 
                 result.success = False
 
                 result.message = (
-                    f'Failed to move to {destination}'
+                    f"Failed to move "
+                    f"to {destination}"
                 )
+
 
                 return result
 
 
             # =============================================
-            # 실제 도착 완료
+            # 도착
             # =============================================
 
-            status = f'ARRIVED_{destination}'
+            status = (
+                f"ARRIVED_{destination}"
+            )
 
-            self.publish_status(status)
+
+            self.publish_status(
+                status
+            )
+
 
             feedback_msg.status = status
 
@@ -321,34 +502,40 @@ class AMRMissionNode(Node):
 
 
             # =============================================
-            # Supermarket 도착
+            # Supermarket
             # =============================================
 
-            if destination == 'SP':
+            if destination == "SP":
 
                 self.publish_status(
-                    'LOADING'
+                    "LOADING"
                 )
 
-                feedback_msg.status = 'LOADING'
-
-                goal_handle.publish_feedback(
-                    feedback_msg
-                )
-
-
-                # 적재 시간 2초
-                # 이 sleep은 유지
-                time.sleep(2.0)
-
-
-                self.publish_status(
-                    'LOAD_COMPLETE'
-                )
 
                 feedback_msg.status = (
-                    'LOAD_COMPLETE'
+                    "LOADING"
                 )
+
+
+                goal_handle.publish_feedback(
+                    feedback_msg
+                )
+
+
+                time.sleep(
+                    2.0
+                )
+
+
+                self.publish_status(
+                    "LOAD_COMPLETE"
+                )
+
+
+                feedback_msg.status = (
+                    "LOAD_COMPLETE"
+                )
+
 
                 goal_handle.publish_feedback(
                     feedback_msg
@@ -356,18 +543,27 @@ class AMRMissionNode(Node):
 
 
             # =============================================
-            # Assembly Cell 도착
+            # Assembly Cell
             # =============================================
 
             else:
 
                 status = (
-                    f'DELIVERY_COMPLETE_{destination}'
+
+                    f"DELIVERY_COMPLETE_"
+                    f"{destination}"
                 )
 
-                self.publish_status(status)
 
-                feedback_msg.status = status
+                self.publish_status(
+                    status
+                )
+
+
+                feedback_msg.status = (
+                    status
+                )
+
 
                 goal_handle.publish_feedback(
                     feedback_msg
@@ -375,23 +571,28 @@ class AMRMissionNode(Node):
 
 
         # =================================================
-        # 전체 Mission 완료
+        # Mission 완료
         # =================================================
 
         self.publish_status(
-            'MISSION_COMPLETE'
+            "MISSION_COMPLETE"
         )
 
 
         goal_handle.succeed()
 
 
-        result = ExecuteMission.Result()
+        result = (
+            ExecuteMission.Result()
+        )
+
 
         result.success = True
 
         result.message = (
-            f'Mission complete: {" -> ".join(route)}'
+
+            f'Mission complete: '
+            f'{" -> ".join(route)}'
         )
 
 
@@ -400,23 +601,49 @@ class AMRMissionNode(Node):
 
 def main(args=None):
 
-    rclpy.init(args=args)
+    rclpy.init(
+        args=args
+    )
+
 
     node = AMRMissionNode()
 
+
+    # 중요:
+    # Action Callback이 목적지 도착을 기다리는 동안
+    # /amr/odom Callback도 계속 돌아야 한다.
+    executor = MultiThreadedExecutor(
+        num_threads=2
+    )
+
+
+    executor.add_node(
+        node
+    )
+
+
     try:
-        rclpy.spin(node)
+
+        executor.spin()
+
 
     except KeyboardInterrupt:
+
         pass
+
 
     finally:
 
+        executor.shutdown()
+
         node.destroy_node()
 
+
         if rclpy.ok():
+
             rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+
     main()
