@@ -567,30 +567,6 @@ og.Controller.edit(
                 "isaacsim.ros2.bridge.ROS2PublishOdometry",
             ),
 
-            # ---------------------------------------------
-            # odom -> base_link dynamic TF
-            # ---------------------------------------------
-            (
-                "PublishOdomTF",
-                "isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
-            ),
-
-            # ---------------------------------------------
-            # base_link -> front_2d_lidar static TF
-            # ---------------------------------------------
-            (
-                "PublishFrontLidarTF",
-                "isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
-            ),
-
-            # ---------------------------------------------
-            # Isaac Sim Simulation Time -> ROS2 /clock
-            # ---------------------------------------------
-            (
-                "PublishClock",
-                "isaacsim.ros2.bridge.ROS2PublishClock",
-            ),
-
             (
                 "SubscribeGoal",
                 "isaacsim.ros2.bridge.ROS2Subscriber",
@@ -645,70 +621,6 @@ og.Controller.edit(
             (
                 "PublishOdom.inputs:chassisFrameId",
                 "base_link",
-            ),
-
-
-            # ---------------------------------------------
-            # Dynamic TF: odom -> base_link
-            # ---------------------------------------------
-            (
-                "PublishOdomTF.inputs:parentFrameId",
-                "odom",
-            ),
-
-            (
-                "PublishOdomTF.inputs:childFrameId",
-                "base_link",
-            ),
-
-            (
-                "PublishOdomTF.inputs:topicName",
-                "/tf",
-            ),
-
-            (
-                "PublishOdomTF.inputs:staticPublisher",
-                False,
-            ),
-
-
-            # ---------------------------------------------
-            # Static TF: base_link -> front_2d_lidar
-            #
-            # Isaac Stage의 front_RPLidar 장착 위치:
-            # x = 0.026 m
-            # y = 0.000 m
-            # z = 0.418 m
-            # rotation = identity
-            # ---------------------------------------------
-            (
-                "PublishFrontLidarTF.inputs:parentFrameId",
-                "base_link",
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:childFrameId",
-                "front_2d_lidar",
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:translation",
-                [0.026, 0.0, 0.418],
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:rotation",
-                [0.0, 0.0, 0.0, 1.0],
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:topicName",
-                "/tf_static",
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:staticPublisher",
-                True,
             ),
 
 
@@ -808,74 +720,6 @@ og.Controller.edit(
             (
                 "Context.outputs:context",
                 "PublishOdom.inputs:context",
-            ),
-
-
-            # ---------------------------------------------
-            # Dynamic TF: odom -> base_link
-            # ComputeOdom과 동일한 pose/time 사용
-            # ---------------------------------------------
-            (
-                "OnPlaybackTick.outputs:tick",
-                "PublishOdomTF.inputs:execIn",
-            ),
-
-            (
-                "ComputeOdom.outputs:position",
-                "PublishOdomTF.inputs:translation",
-            ),
-
-            (
-                "ComputeOdom.outputs:orientation",
-                "PublishOdomTF.inputs:rotation",
-            ),
-
-            (
-                "ReadSimTime.outputs:simulationTime",
-                "PublishOdomTF.inputs:timeStamp",
-            ),
-
-            (
-                "Context.outputs:context",
-                "PublishOdomTF.inputs:context",
-            ),
-
-
-            # ---------------------------------------------
-            # Static TF: base_link -> front_2d_lidar
-            # ---------------------------------------------
-            (
-                "OnPlaybackTick.outputs:tick",
-                "PublishFrontLidarTF.inputs:execIn",
-            ),
-
-            (
-                "ReadSimTime.outputs:simulationTime",
-                "PublishFrontLidarTF.inputs:timeStamp",
-            ),
-
-            (
-                "Context.outputs:context",
-                "PublishFrontLidarTF.inputs:context",
-            ),
-
-
-            # ---------------------------------------------
-            # Isaac Sim Time -> /clock
-            # ---------------------------------------------
-            (
-                "OnPlaybackTick.outputs:tick",
-                "PublishClock.inputs:execIn",
-            ),
-
-            (
-                "ReadSimTime.outputs:simulationTime",
-                "PublishClock.inputs:timeStamp",
-            ),
-
-            (
-                "Context.outputs:context",
-                "PublishClock.inputs:context",
             ),
 
 
@@ -1276,18 +1120,6 @@ print(
 )
 
 print(
-    "Clock Topic : /clock"
-)
-
-print(
-    "TF Dynamic  : odom -> base_link"
-)
-
-print(
-    "TF Static   : base_link -> front_2d_lidar"
-)
-
-print(
     "TCP 5005    : REMOVED"
 )
 
@@ -1402,21 +1234,6 @@ print(
 print(
     "Velocity Command: "
     "ROS2 Bridge <- /cmd_vel"
-)
-
-print(
-    "Simulation Clock : "
-    "ROS2 Bridge -> /clock"
-)
-
-print(
-    "TF Dynamic       : "
-    "odom -> base_link"
-)
-
-print(
-    "TF Static        : "
-    "base_link -> front_2d_lidar"
 )
 
 print("=" * 60)

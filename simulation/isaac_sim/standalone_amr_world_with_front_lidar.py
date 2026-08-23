@@ -567,42 +567,9 @@ og.Controller.edit(
                 "isaacsim.ros2.bridge.ROS2PublishOdometry",
             ),
 
-            # ---------------------------------------------
-            # odom -> base_link dynamic TF
-            # ---------------------------------------------
-            (
-                "PublishOdomTF",
-                "isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
-            ),
-
-            # ---------------------------------------------
-            # base_link -> front_2d_lidar static TF
-            # ---------------------------------------------
-            (
-                "PublishFrontLidarTF",
-                "isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
-            ),
-
-            # ---------------------------------------------
-            # Isaac Sim Simulation Time -> ROS2 /clock
-            # ---------------------------------------------
-            (
-                "PublishClock",
-                "isaacsim.ros2.bridge.ROS2PublishClock",
-            ),
-
             (
                 "SubscribeGoal",
                 "isaacsim.ros2.bridge.ROS2Subscriber",
-            ),
-
-            # ---------------------------------------------
-            # /cmd_vel
-            # geometry_msgs/msg/Twist 전용 Subscriber
-            # ---------------------------------------------
-            (
-                "SubscribeCmdVel",
-                "isaacsim.ros2.bridge.ROS2SubscribeTwist",
             ),
         ],
 
@@ -649,70 +616,6 @@ og.Controller.edit(
 
 
             # ---------------------------------------------
-            # Dynamic TF: odom -> base_link
-            # ---------------------------------------------
-            (
-                "PublishOdomTF.inputs:parentFrameId",
-                "odom",
-            ),
-
-            (
-                "PublishOdomTF.inputs:childFrameId",
-                "base_link",
-            ),
-
-            (
-                "PublishOdomTF.inputs:topicName",
-                "/tf",
-            ),
-
-            (
-                "PublishOdomTF.inputs:staticPublisher",
-                False,
-            ),
-
-
-            # ---------------------------------------------
-            # Static TF: base_link -> front_2d_lidar
-            #
-            # Isaac Stage의 front_RPLidar 장착 위치:
-            # x = 0.026 m
-            # y = 0.000 m
-            # z = 0.418 m
-            # rotation = identity
-            # ---------------------------------------------
-            (
-                "PublishFrontLidarTF.inputs:parentFrameId",
-                "base_link",
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:childFrameId",
-                "front_2d_lidar",
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:translation",
-                [0.026, 0.0, 0.418],
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:rotation",
-                [0.0, 0.0, 0.0, 1.0],
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:topicName",
-                "/tf_static",
-            ),
-
-            (
-                "PublishFrontLidarTF.inputs:staticPublisher",
-                True,
-            ),
-
-
-            # ---------------------------------------------
             # /amr/goal
             #
             # geometry_msgs/msg/Point
@@ -736,16 +639,6 @@ og.Controller.edit(
             (
                 "SubscribeGoal.inputs:messageName",
                 "Point",
-            ),
-
-
-            # ---------------------------------------------
-            # /cmd_vel
-            # geometry_msgs/msg/Twist
-            # ---------------------------------------------
-            (
-                "SubscribeCmdVel.inputs:topicName",
-                "/cmd_vel",
             ),
 
 
@@ -812,74 +705,6 @@ og.Controller.edit(
 
 
             # ---------------------------------------------
-            # Dynamic TF: odom -> base_link
-            # ComputeOdom과 동일한 pose/time 사용
-            # ---------------------------------------------
-            (
-                "OnPlaybackTick.outputs:tick",
-                "PublishOdomTF.inputs:execIn",
-            ),
-
-            (
-                "ComputeOdom.outputs:position",
-                "PublishOdomTF.inputs:translation",
-            ),
-
-            (
-                "ComputeOdom.outputs:orientation",
-                "PublishOdomTF.inputs:rotation",
-            ),
-
-            (
-                "ReadSimTime.outputs:simulationTime",
-                "PublishOdomTF.inputs:timeStamp",
-            ),
-
-            (
-                "Context.outputs:context",
-                "PublishOdomTF.inputs:context",
-            ),
-
-
-            # ---------------------------------------------
-            # Static TF: base_link -> front_2d_lidar
-            # ---------------------------------------------
-            (
-                "OnPlaybackTick.outputs:tick",
-                "PublishFrontLidarTF.inputs:execIn",
-            ),
-
-            (
-                "ReadSimTime.outputs:simulationTime",
-                "PublishFrontLidarTF.inputs:timeStamp",
-            ),
-
-            (
-                "Context.outputs:context",
-                "PublishFrontLidarTF.inputs:context",
-            ),
-
-
-            # ---------------------------------------------
-            # Isaac Sim Time -> /clock
-            # ---------------------------------------------
-            (
-                "OnPlaybackTick.outputs:tick",
-                "PublishClock.inputs:execIn",
-            ),
-
-            (
-                "ReadSimTime.outputs:simulationTime",
-                "PublishClock.inputs:timeStamp",
-            ),
-
-            (
-                "Context.outputs:context",
-                "PublishClock.inputs:context",
-            ),
-
-
-            # ---------------------------------------------
             # Tick -> Goal Subscriber
             # ---------------------------------------------
 
@@ -891,20 +716,6 @@ og.Controller.edit(
             (
                 "Context.outputs:context",
                 "SubscribeGoal.inputs:context",
-            ),
-
-
-            # ---------------------------------------------
-            # Tick -> /cmd_vel Subscriber
-            # ---------------------------------------------
-            (
-                "OnPlaybackTick.outputs:tick",
-                "SubscribeCmdVel.inputs:execIn",
-            ),
-
-            (
-                "Context.outputs:context",
-                "SubscribeCmdVel.inputs:context",
             ),
         ],
     },
@@ -1178,50 +989,6 @@ goal_z_attr = (
 )
 
 
-# =========================================================
-# /cmd_vel Subscriber 출력 Attribute
-# =========================================================
-
-CMD_VEL_NODE_PATH = (
-    ROS2_GRAPH_PATH
-    + "/SubscribeCmdVel"
-)
-
-
-cmd_linear_attr = (
-    og.Controller.attribute(
-
-        CMD_VEL_NODE_PATH
-        + ".outputs:linearVelocity"
-    )
-)
-
-
-cmd_angular_attr = (
-    og.Controller.attribute(
-
-        CMD_VEL_NODE_PATH
-        + ".outputs:angularVelocity"
-    )
-)
-
-
-if (
-
-    cmd_linear_attr is None
-    or not cmd_linear_attr.is_valid()
-    or cmd_angular_attr is None
-    or not cmd_angular_attr.is_valid()
-):
-
-    raise RuntimeError(
-
-        "ROS2 SubscribeTwist 출력 "
-        "linearVelocity/angularVelocity를 "
-        "찾지 못했습니다."
-    )
-
-
 if (
 
     goal_x_attr is None
@@ -1269,22 +1036,6 @@ print(
 
 print(
     "Odom Topic  : /amr/odom"
-)
-
-print(
-    "CmdVel Topic: /cmd_vel"
-)
-
-print(
-    "Clock Topic : /clock"
-)
-
-print(
-    "TF Dynamic  : odom -> base_link"
-)
-
-print(
-    "TF Static   : base_link -> front_2d_lidar"
 )
 
 print(
@@ -1399,26 +1150,6 @@ print(
     "ROS2 Bridge -> /amr/odom"
 )
 
-print(
-    "Velocity Command: "
-    "ROS2 Bridge <- /cmd_vel"
-)
-
-print(
-    "Simulation Clock : "
-    "ROS2 Bridge -> /clock"
-)
-
-print(
-    "TF Dynamic       : "
-    "odom -> base_link"
-)
-
-print(
-    "TF Static        : "
-    "base_link -> front_2d_lidar"
-)
-
 print("=" * 60)
 print("")
 
@@ -1438,20 +1169,6 @@ print_counter = 0
 
 # /amr/goal Point.z의 command_id
 last_goal_command_id = 0
-
-
-# =========================================================
-# /cmd_vel 제어 상태
-#
-# 기본은 기존 /amr/goal Pose Controller.
-# non-zero /cmd_vel을 받으면 /cmd_vel이 제어권을 가진다.
-# 이후 새로운 /amr/goal이 들어오면 다시 기존 제어로 돌아간다.
-# =========================================================
-
-cmd_vel_active = False
-cmd_linear_x = 0.0
-cmd_angular_z = 0.0
-cmd_print_counter = 0
 
 
 # =========================================================
@@ -1512,65 +1229,7 @@ while simulation_app.is_running():
 
 
     # =====================================================
-    # 2. /cmd_vel 읽기
-    #
-    # geometry_msgs/msg/Twist
-    # linear.x  -> 전진/후진 속도 [m/s]
-    # angular.z -> 회전 속도 [rad/s]
-    # =====================================================
-
-    try:
-
-        linear_velocity = np.array(
-
-            og.Controller.get(
-                cmd_linear_attr
-            ),
-
-            dtype=np.float64,
-        )
-
-
-        angular_velocity = np.array(
-
-            og.Controller.get(
-                cmd_angular_attr
-            ),
-
-            dtype=np.float64,
-        )
-
-
-        cmd_linear_x = float(
-            linear_velocity[0]
-        )
-
-
-        cmd_angular_z = float(
-            angular_velocity[2]
-        )
-
-
-        if (
-
-            abs(cmd_linear_x) > 1e-4
-            or abs(cmd_angular_z) > 1e-4
-        ):
-
-            cmd_vel_active = True
-
-
-    except Exception as error:
-
-        print(
-
-            f"[CMD_VEL ERROR] "
-            f"{error}"
-        )
-
-
-    # =====================================================
-    # 3. 새로운 Goal인지 확인
+    # 2. 새로운 Goal인지 확인
     # =====================================================
 
     if (
@@ -1584,11 +1243,6 @@ while simulation_app.is_running():
         last_goal_command_id = (
             goal_command_id
         )
-
-
-        # 새로운 /amr/goal이 들어오면
-        # 기존 Pose Controller가 다시 제어권을 가진다.
-        cmd_vel_active = False
 
 
         TARGET_POSITION = np.array(
@@ -1641,7 +1295,7 @@ while simulation_app.is_running():
 
 
     # =====================================================
-    # 4. 현재 위치
+    # 3. 현재 위치
     # =====================================================
 
     (
@@ -1651,55 +1305,10 @@ while simulation_app.is_running():
 
 
     # =====================================================
-    # 5. /cmd_vel 제어
+    # 4. Goal 존재
     # =====================================================
 
-    if cmd_vel_active:
-
-
-        cmd_action = (
-            differential_controller.forward(
-
-                command=np.array(
-                    [
-                        cmd_linear_x,
-                        cmd_angular_z,
-                    ],
-
-                    dtype=np.float32,
-                )
-            )
-        )
-
-
-        amr.apply_wheel_actions(
-            cmd_action
-        )
-
-
-        cmd_print_counter += 1
-
-
-        if cmd_print_counter >= 30:
-
-            cmd_print_counter = 0
-
-
-            print(
-
-                f"[CMD_VEL] "
-                f"linear.x={cmd_linear_x:5.2f} m/s "
-                f"angular.z={cmd_angular_z:5.2f} rad/s "
-                f"| x={current_position[0]:6.2f} "
-                f"y={current_position[1]:6.2f}"
-            )
-
-
-    # =====================================================
-    # 6. 기존 /amr/goal Pose Controller
-    # =====================================================
-
-    elif TARGET_POSITION is not None:
+    if TARGET_POSITION is not None:
 
 
         dx = (
@@ -1836,13 +1445,11 @@ while simulation_app.is_running():
 
 
     # =====================================================
-    # 7. Simulation Step
+    # 5. Simulation Step
     #
     # 여기서
     # - /amr/goal 구독
-    # - /cmd_vel 구독
     # - /amr/odom 발행
-    # - /front_2d_lidar/scan 발행
     # =====================================================
 
     world.step(

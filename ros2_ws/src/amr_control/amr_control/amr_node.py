@@ -1,14 +1,15 @@
-import math
 import threading
 import time
 
 import rclpy
 
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from geometry_msgs.msg import Point
+from action_msgs.msg import GoalStatus
+from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
@@ -19,14 +20,13 @@ from interfaces.srv import RequestTask
 # 이동 설정
 # =========================================================
 
-ARRIVAL_TOLERANCE_M = 0.20
+# NavigateToPose 한 구간(Pickup / Delivery)의 최대 대기 시간
 MOVE_TIMEOUT_SEC = 60.0
-CHECK_INTERVAL_SEC = 0.05
 
 # FMS에 다음 작업을 요청하는 주기
 TASK_REQUEST_INTERVAL_SEC = 1.0
 
-# 현재는 실제 Pick 동작이 없으므로
+# 현재는 실제 Pick 장비가 없으므로
 # Supermarket 도착 후 적재 시간을 임시로 사용
 LOADING_TIME_SEC = 2.0
 
@@ -39,10 +39,6 @@ class AMRNode(Node):
 
         # =================================================
         # AMR Identity
-        #
-        # 현재 Scenario 0에서는 AMR 1대
-        # 추후 Multi-AMR에서는
-        # AMR_02, AMR_03 ... 으로 확장
         # =================================================
 
         self.amr_id = "AMR_01"
@@ -63,23 +59,25 @@ class AMRNode(Node):
         # 내부 동작 상태
         # =================================================
 
-        # FMS에 Task 요청이 진행 중인지
         self.task_request_pending = False
-
-        # 현재 Task를 실제 수행 중인지
         self.task_running = False
 
 
         # =================================================
         # Callback Group
         #
-        # Task Service 응답 처리 중에도
-        # /amr/odom이 계속 들어와야 함
+        # - /amr/odom
+        # - FMS RequestTask
+        # - Timer
+        # - Nav2 Action
+        #
+        # 서로 독립적으로 처리
         # =================================================
 
         self.odom_group = MutuallyExclusiveCallbackGroup()
         self.service_group = MutuallyExclusiveCallbackGroup()
         self.timer_group = MutuallyExclusiveCallbackGroup()
+        self.action_group = MutuallyExclusiveCallbackGroup()
 
 
         # =================================================
@@ -97,24 +95,33 @@ class AMRNode(Node):
 
 
         # =================================================
-        # AMR -> Isaac Sim
+        # AMR -> Nav2
         #
-        # 현재 임시 이동 방식
+        # 기존 /amr/goal 직접 제어 제거
         #
-        # 향후 Nav2 NavigateToPose로 교체 예정
+        # 이제 목적지는 Nav2 NavigateToPose Action으로 전달
         # =================================================
 
-        self.goal_publisher = self.create_publisher(
-            Point,
-            "/amr/goal",
-            10,
+        self.nav2_client = ActionClient(
+            self,
+            NavigateToPose,
+            "/navigate_to_pose",
+            callback_group=self.action_group,
         )
 
 
         # =================================================
         # Isaac Sim -> AMR
         #
-        # Isaac ROS2 Bridge가 발행하는 Odometry
+        # Isaac ROS2 Bridge가 계속 발행하는 Odometry
+        #
+        # 이 값은:
+        # - AMR 현재 위치 저장
+        # - FMS Task 요청 시 현재 위치 전달
+        # 에 사용
+        #
+        # 실제 이동 성공 판정은 더 이상 여기서 거리 계산하지 않고
+        # NavigateToPose Action Result를 사용
         # =================================================
 
         self.odom_subscription = self.create_subscription(
@@ -129,7 +136,7 @@ class AMRNode(Node):
         # =================================================
         # AMR -> FMS
         #
-        # 상태가 변경될 때 이벤트 발행
+        # 상태 변화 Event
         # =================================================
 
         self.status_publisher = self.create_publisher(
@@ -152,14 +159,6 @@ class AMRNode(Node):
         # =================================================
 
         self.task_lock = threading.Lock()
-
-
-        # =================================================
-        # 같은 좌표가 연속 Goal이어도
-        # Isaac이 새 명령으로 인식하도록 하는 ID
-        # =================================================
-
-        self.goal_command_id = 0
 
 
         # =================================================
@@ -186,27 +185,31 @@ class AMRNode(Node):
         )
 
         self.get_logger().info(
-            f"AMR ID        : {self.amr_id}"
+            f"AMR ID         : {self.amr_id}"
         )
 
         self.get_logger().info(
-            "Task Service  : /fms/request_task"
+            "Task Service   : /fms/request_task"
         )
 
         self.get_logger().info(
-            "Goal Topic    : /amr/goal"
+            "Nav2 Action    : /navigate_to_pose"
         )
 
         self.get_logger().info(
-            "Odom Topic    : /amr/odom"
+            "Odom Topic     : /amr/odom"
         )
 
         self.get_logger().info(
-            "Status Topic  : /amr/status"
+            "Status Topic   : /amr/status"
         )
 
         self.get_logger().info(
-            "ExecuteMission: REMOVED"
+            "Direct Goal    : /amr/goal REMOVED"
+        )
+
+        self.get_logger().info(
+            "ExecuteMission : REMOVED"
         )
 
         self.get_logger().info(
@@ -264,10 +267,6 @@ class AMRNode(Node):
 
     # =====================================================
     # AMR 상태 Event 발행
-    #
-    # FMS는 이 Topic을 계속 polling하는 것이 아니라
-    # 상태가 바뀔 때 발생하는 Event를 받아
-    # 마지막 상태만 관리하면 됨
     # =====================================================
 
     def publish_status(
@@ -307,49 +306,31 @@ class AMRNode(Node):
 
     def try_request_task(self):
 
-        # =================================================
         # 현재 Task 수행 중
-        # =================================================
-
         if self.task_running:
 
             return
 
 
-        # =================================================
         # 이미 Service 요청 중
-        # =================================================
-
         if self.task_request_pending:
 
             return
 
 
-        # =================================================
         # ERROR 상태에서는 자동으로 새 Task를 받지 않음
-        # =================================================
-
         if self.state == "ERROR":
 
             return
 
 
-        # =================================================
-        # IDLE 상태에서만 다음 Task 요청
-        # =================================================
-
+        # IDLE 상태에서만 요청
         if self.state != "IDLE":
 
             return
 
 
-        # =================================================
-        # 현재 위치가 아직 안 들어온 경우
-        #
-        # FMS에 잘못된 위치를 보내지 않도록
-        # /amr/odom 수신 후 요청 시작
-        # =================================================
-
+        # /amr/odom이 아직 안 들어온 경우
         current_position = (
             self.get_current_position()
         )
@@ -360,10 +341,7 @@ class AMRNode(Node):
             return
 
 
-        # =================================================
-        # FMS Service가 아직 실행되지 않은 경우
-        # =================================================
-
+        # FMS Service가 아직 준비되지 않은 경우
         if not self.task_client.service_is_ready():
 
             self.get_logger().info(
@@ -379,7 +357,7 @@ class AMRNode(Node):
 
 
         # =================================================
-        # Request 생성
+        # RequestTask 요청 생성
         # =================================================
 
         request = RequestTask.Request()
@@ -402,10 +380,6 @@ class AMRNode(Node):
             self.load_state
         )
 
-
-        # =================================================
-        # 비동기 Service 요청
-        # =================================================
 
         self.task_request_pending = True
 
@@ -454,10 +428,7 @@ class AMRNode(Node):
             return
 
 
-        # =================================================
-        # FMS에 현재 대기 Task가 없음
-        # =================================================
-
+        # FMS에 대기 Task가 없음
         if not response.has_task:
 
             self.get_logger().info(
@@ -544,14 +515,8 @@ class AMRNode(Node):
         )
 
 
-        # =================================================
-        # 실제 이동은 Blocking Loop를 사용하므로
-        # 별도 Worker Thread에서 수행
-        #
-        # 그래야 Executor가 /amr/odom과
-        # Service Callback을 계속 처리할 수 있음
-        # =================================================
-
+        # 실제 Mission은 Blocking 대기를 포함하므로
+        # Worker Thread에서 수행
         worker = threading.Thread(
             target=self.execute_task,
             args=(response,),
@@ -564,14 +529,10 @@ class AMRNode(Node):
     # =====================================================
     # Task 실행
     #
-    # FMS가 이미:
+    # FMS가 논리 Location -> 물리 좌표 변환 완료 후
+    # pickup_x/y, delivery_x/y를 전달
     #
-    # Logical Location
-    #      ↓
-    # Physical Coordinate
-    #
-    # 변환을 끝낸 상태이므로
-    # AMR은 받은 좌표를 그대로 사용
+    # AMR은 받은 좌표를 Nav2에 그대로 Goal로 전달
     # =====================================================
 
     def execute_task(
@@ -582,7 +543,7 @@ class AMRNode(Node):
         try:
 
             # =================================================
-            # 1. Pickup 위치로 이동
+            # 1. Pickup 위치로 Nav2 이동
             # =================================================
 
             self.publish_status(
@@ -624,8 +585,7 @@ class AMRNode(Node):
             # =================================================
             # 2. Kit 적재
             #
-            # 현재는 실제 Pick 장비가 없으므로
-            # 시간으로 가정
+            # 현재는 실제 Pick 장비가 없으므로 시간으로 가정
             # =================================================
 
             self.publish_status(
@@ -647,7 +607,7 @@ class AMRNode(Node):
 
 
             # =================================================
-            # 3. Delivery 위치로 이동
+            # 3. Delivery 위치로 Nav2 이동
             # =================================================
 
             self.publish_status(
@@ -688,9 +648,6 @@ class AMRNode(Node):
 
             # =================================================
             # 4. Delivery 완료
-            #
-            # 현재는 Cell 영역 도착 =
-            # 부품 배송 완료로 가정
             # =================================================
 
             self.load_state = "EMPTY"
@@ -717,10 +674,9 @@ class AMRNode(Node):
 
 
             # =================================================
-            # 6. AMR을 다시 IDLE 상태로 변경
+            # 6. 다시 IDLE
             #
-            # 다음 Timer Tick에서
-            # FMS에 새로운 Task를 Pull 요청하게 됨
+            # 다음 Timer Tick에서 새 Task Pull
             # =================================================
 
             with self.task_lock:
@@ -773,60 +729,71 @@ class AMRNode(Node):
 
 
     # =====================================================
-    # Isaac Sim으로 Goal 발행
+    # Nav2 Feedback
     #
-    # 현재는 /amr/goal 방식
-    # 향후 Nav2 NavigateToPose로 교체 예정
+    # NavigateToPose가 이동 중 남은 거리를 전달
+    # 너무 많은 로그를 막기 위해 1초에 한 번만 출력
     # =====================================================
 
-    def publish_goal(
+    def nav2_feedback_callback(
         self,
-        goal_x,
-        goal_y,
+        feedback_msg,
     ):
 
-        self.goal_command_id += 1
+        feedback = feedback_msg.feedback
+
+        now = time.monotonic()
 
 
-        msg = Point()
+        if not hasattr(
+            self,
+            "_last_nav_feedback_log_time",
+        ):
 
-        msg.x = float(
-            goal_x
-        )
-
-        msg.y = float(
-            goal_y
-        )
+            self._last_nav_feedback_log_time = 0.0
 
 
-        # 지금은 z를 높이로 사용하지 않으므로
-        # command_id 용도로 사용
-        msg.z = float(
-            self.goal_command_id
-        )
+        if (
+            now
+            - self._last_nav_feedback_log_time
+            < 1.0
+        ):
+
+            return
 
 
-        self.goal_publisher.publish(
-            msg
-        )
+        self._last_nav_feedback_log_time = now
 
 
-        self.get_logger().info(
-            f"Goal published: "
-            f"x={goal_x:.2f}, "
-            f"y={goal_y:.2f}, "
-            f"id={self.goal_command_id}"
-        )
+        try:
+
+            distance_remaining = float(
+                feedback.distance_remaining
+            )
+
+
+            self.get_logger().info(
+                f"[NAV2] "
+                f"distance_remaining="
+                f"{distance_remaining:.2f}m"
+            )
+
+
+        except Exception:
+
+            pass
 
 
     # =====================================================
     # 목적지 이동
     #
-    # 중요:
-    # 예전처럼 AMR Node 내부 LOCATIONS를 조회하지 않음
+    # 기존:
+    # /amr/goal Publish
+    # + /amr/odom 거리 직접 계산
     #
-    # FMS가 논리 위치를 물리좌표로 변환해서
-    # x / y를 전달함
+    # 현재:
+    # NavigateToPose Action Goal
+    # + Action Result로 성공 / 실패 판정
     # =====================================================
 
     def move_to_destination(
@@ -836,128 +803,374 @@ class AMRNode(Node):
         goal_y,
     ):
 
-        self.publish_goal(
-            goal_x,
-            goal_y,
+        # =================================================
+        # 1. Nav2 Action Server 확인
+        # =================================================
+
+        self.get_logger().info(
+            f"[NAV2] Waiting for "
+            f"/navigate_to_pose..."
         )
 
 
-        start_time = (
-            time.monotonic()
-        )
+        if not self.nav2_client.wait_for_server(
+            timeout_sec=5.0
+        ):
 
-        last_log_time = 0.0
+            self.get_logger().error(
+                "Nav2 NavigateToPose "
+                "Action Server is not available."
+            )
+
+            return False
 
 
         # =================================================
-        # 현재는 /amr/odom 기반 도착 판정
+        # 2. Goal 생성
         #
-        # Nav2 도입 후에는
-        # NavigateToPose Action Result 기반으로 교체 예정
+        # FMS 좌표와 Nav2 Map 좌표가 현재 동일한
+        # 공장 좌표계를 사용하므로 frame_id = map
+        #
+        # orientation은 우선 yaw=0으로 사용
         # =================================================
 
-        while rclpy.ok():
+        goal_msg = NavigateToPose.Goal()
 
-            elapsed = (
-                time.monotonic()
-                - start_time
+        goal_msg.pose.header.frame_id = (
+            "map"
+        )
+
+
+        goal_msg.pose.pose.position.x = (
+            float(goal_x)
+        )
+
+        goal_msg.pose.pose.position.y = (
+            float(goal_y)
+        )
+
+        goal_msg.pose.pose.position.z = 0.0
+
+
+        # yaw = 0
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
+        goal_msg.pose.pose.orientation.z = 0.0
+        goal_msg.pose.pose.orientation.w = 1.0
+
+
+        self.get_logger().info(
+            "================================="
+        )
+
+        self.get_logger().info(
+            f"NAV2 GOAL: {destination_id}"
+        )
+
+        self.get_logger().info(
+            f"x={goal_x:.2f}, "
+            f"y={goal_y:.2f}"
+        )
+
+        self.get_logger().info(
+            "frame=map"
+        )
+
+        self.get_logger().info(
+            "================================="
+        )
+
+
+        # =================================================
+        # 3. Goal 전송
+        #
+        # Executor는 main thread에서 계속 spin 중이므로
+        # Action Future 완료는 callback으로 받고
+        # Worker Thread는 Event로 대기
+        # =================================================
+
+        goal_response_event = (
+            threading.Event()
+        )
+
+        result_event = (
+            threading.Event()
+        )
+
+
+        goal_handle_box = {
+            "handle": None
+        }
+
+        result_box = {
+            "status": None,
+            "result": None,
+            "error": None,
+        }
+
+
+        send_goal_future = (
+            self.nav2_client.send_goal_async(
+                goal_msg,
+                feedback_callback=(
+                    self.nav2_feedback_callback
+                ),
+            )
+        )
+
+
+        def goal_response_callback(
+            future,
+        ):
+
+            try:
+
+                goal_handle = (
+                    future.result()
+                )
+
+
+                goal_handle_box[
+                    "handle"
+                ] = goal_handle
+
+
+                if not goal_handle.accepted:
+
+                    self.get_logger().error(
+                        f"[NAV2] Goal rejected: "
+                        f"{destination_id}"
+                    )
+
+                    goal_response_event.set()
+                    result_event.set()
+
+                    return
+
+
+                self.get_logger().info(
+                    f"[NAV2] Goal accepted: "
+                    f"{destination_id}"
+                )
+
+
+                goal_response_event.set()
+
+
+                get_result_future = (
+                    goal_handle.get_result_async()
+                )
+
+
+                def result_callback(
+                    result_future,
+                ):
+
+                    try:
+
+                        wrapped_result = (
+                            result_future.result()
+                        )
+
+
+                        result_box[
+                            "status"
+                        ] = (
+                            wrapped_result.status
+                        )
+
+                        result_box[
+                            "result"
+                        ] = (
+                            wrapped_result.result
+                        )
+
+
+                    except Exception as error:
+
+                        result_box[
+                            "error"
+                        ] = error
+
+
+                    finally:
+
+                        result_event.set()
+
+
+                get_result_future.add_done_callback(
+                    result_callback
+                )
+
+
+            except Exception as error:
+
+                result_box[
+                    "error"
+                ] = error
+
+                goal_response_event.set()
+                result_event.set()
+
+
+        send_goal_future.add_done_callback(
+            goal_response_callback
+        )
+
+
+        # =================================================
+        # 4. Goal Accept / Reject 대기
+        # =================================================
+
+        if not goal_response_event.wait(
+            timeout=10.0
+        ):
+
+            self.get_logger().error(
+                f"[NAV2] Goal response timeout: "
+                f"{destination_id}"
+            )
+
+            return False
+
+
+        goal_handle = (
+            goal_handle_box["handle"]
+        )
+
+
+        if (
+            goal_handle is None
+
+            or not goal_handle.accepted
+        ):
+
+            return False
+
+
+        # =================================================
+        # 5. Result 대기
+        # =================================================
+
+        if not result_event.wait(
+            timeout=MOVE_TIMEOUT_SEC
+        ):
+
+            self.get_logger().error(
+                f"[NAV2] Move timeout: "
+                f"{destination_id}"
             )
 
 
-            # =================================================
-            # Timeout
-            # =================================================
+            # Timeout이면 Nav2 Goal 취소 요청
+            try:
 
-            if elapsed >= MOVE_TIMEOUT_SEC:
-
-                self.get_logger().error(
-                    f"Timeout while moving "
-                    f"to {destination_id}"
-                )
-
-                return False
+                goal_handle.cancel_goal_async()
 
 
-            # =================================================
-            # 최신 위치
-            # =================================================
+            except Exception:
+
+                pass
+
+
+            return False
+
+
+        # =================================================
+        # 6. Action 처리 중 Exception
+        # =================================================
+
+        if result_box["error"] is not None:
+
+            self.get_logger().error(
+                f"[NAV2] Action error: "
+                f"{result_box['error']}"
+            )
+
+            return False
+
+
+        # =================================================
+        # 7. Action Result 판정
+        # =================================================
+
+        status = (
+            result_box["status"]
+        )
+
+
+        if (
+            status
+            == GoalStatus.STATUS_SUCCEEDED
+        ):
 
             current_position = (
                 self.get_current_position()
             )
 
 
-            if current_position is None:
+            if current_position is not None:
 
-                time.sleep(
-                    CHECK_INTERVAL_SEC
+                current_x, current_y = (
+                    current_position
                 )
-
-                continue
-
-
-            current_x, current_y = (
-                current_position
-            )
-
-
-            # =================================================
-            # 목표까지 거리
-            # =================================================
-
-            distance = math.hypot(
-
-                goal_x - current_x,
-
-                goal_y - current_y,
-            )
-
-
-            # =================================================
-            # 도착
-            # =================================================
-
-            if (
-                distance
-                <= ARRIVAL_TOLERANCE_M
-            ):
-
-                self.get_logger().info(
-                    f"Reached {destination_id}: "
-                    f"x={current_x:.2f}, "
-                    f"y={current_y:.2f}, "
-                    f"distance={distance:.3f}m"
-                )
-
-                return True
-
-
-            # =================================================
-            # 이동 중 로그
-            # =================================================
-
-            now = time.monotonic()
-
-
-            if (
-                now - last_log_time
-                >= 1.0
-            ):
-
-                last_log_time = now
 
 
                 self.get_logger().info(
-                    f"Moving {destination_id}: "
+                    f"[NAV2] Reached "
+                    f"{destination_id}: "
                     f"x={current_x:.2f}, "
-                    f"y={current_y:.2f}, "
-                    f"distance={distance:.2f}m"
+                    f"y={current_y:.2f}"
                 )
 
 
-            time.sleep(
-                CHECK_INTERVAL_SEC
-            )
+            else:
+
+                self.get_logger().info(
+                    f"[NAV2] Reached "
+                    f"{destination_id}"
+                )
+
+
+            return True
+
+
+        # =================================================
+        # 실패 상태
+        # =================================================
+
+        status_name = {
+            GoalStatus.STATUS_UNKNOWN:
+                "UNKNOWN",
+
+            GoalStatus.STATUS_ACCEPTED:
+                "ACCEPTED",
+
+            GoalStatus.STATUS_EXECUTING:
+                "EXECUTING",
+
+            GoalStatus.STATUS_CANCELING:
+                "CANCELING",
+
+            GoalStatus.STATUS_SUCCEEDED:
+                "SUCCEEDED",
+
+            GoalStatus.STATUS_CANCELED:
+                "CANCELED",
+
+            GoalStatus.STATUS_ABORTED:
+                "ABORTED",
+        }.get(
+            status,
+            str(status),
+        )
+
+
+        self.get_logger().error(
+            f"[NAV2] Navigation failed: "
+            f"{destination_id}, "
+            f"status={status_name}"
+        )
 
 
         return False
@@ -974,15 +1187,16 @@ def main(args=None):
 
 
     # =====================================================
-    # 여러 Callback을 동시에 처리해야 함
+    # 여러 Callback 동시 처리
     #
     # - /amr/odom
     # - RequestTask Service response
     # - Task Request Timer
+    # - NavigateToPose Action callbacks
     # =====================================================
 
     executor = MultiThreadedExecutor(
-        num_threads=3
+        num_threads=4
     )
 
 
