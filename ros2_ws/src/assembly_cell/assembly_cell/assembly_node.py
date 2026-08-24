@@ -8,6 +8,16 @@ from .assembly_cell import AssemblyCell
 
 class AssemblyNode(Node):
 
+    # ========================================================
+    # FMS 요청 재전송 주기
+    #
+    # 부품이 도착할 때까지 같은 Task를
+    # 2초마다 다시 요청
+    # ========================================================
+
+    REQUEST_RETRY_INTERVAL = 2.0
+
+
     def __init__(self):
 
         super().__init__("assembly_node")
@@ -17,7 +27,6 @@ class AssemblyNode(Node):
         # ROS2 Publisher
         #
         # Assembly -> FMS
-        # "Cell A에 STAR 부품이 필요합니다."
         # ====================================================
 
         self.request_publisher = self.create_publisher(
@@ -30,10 +39,7 @@ class AssemblyNode(Node):
         # ====================================================
         # ROS2 Subscriber
         #
-        # Area Detection Node -> Assembly
-        #
-        # 예:
-        # cell_id=A
+        # Area Detection -> Assembly
         # ====================================================
 
         self.arrival_subscriber = self.create_subscription(
@@ -46,8 +52,6 @@ class AssemblyNode(Node):
 
         # ====================================================
         # Assembly Cell 생성
-        #
-        # AssemblyCell 생성 시 각각 랜덤 Task 3개 자동 생성
         # ====================================================
 
         self.cells = {
@@ -58,18 +62,41 @@ class AssemblyNode(Node):
 
 
         # ====================================================
-        # 각 Cell의 현재 Task를
-        # FMS에 이미 요청했는지 저장
+        # 마지막으로 요청을 보낸 시간
         #
-        # False = 아직 요청 안 함
-        # True  = 이미 요청함
+        # 기존 request_sent=True/False 방식 제거
+        #
+        # 이제:
+        #
+        # WAITING_FOR_PART 상태라면
+        # 일정 시간마다 요청을 다시 보냄
         # ====================================================
 
-        self.request_sent = {
-            "A": False,
-            "B": False,
-            "C": False,
+        self.last_request_time = {
+            "A": -self.REQUEST_RETRY_INTERVAL,
+            "B": -self.REQUEST_RETRY_INTERVAL,
+            "C": -self.REQUEST_RETRY_INTERVAL,
         }
+
+
+        # ====================================================
+        # 현재 요청 중인 Task ID
+        #
+        # Queue의 맨 앞 Task가 바뀌었는지 확인하기 위함
+        # ====================================================
+
+        self.last_request_task_id = {
+            "A": None,
+            "B": None,
+            "C": None,
+        }
+
+
+        # ====================================================
+        # FMS 연결 대기 로그 중복 방지
+        # ====================================================
+
+        self.waiting_for_fms_logged = False
 
 
         # ====================================================
@@ -104,12 +131,18 @@ class AssemblyNode(Node):
         )
 
         self.get_logger().info(
+            f"FMS retry interval : "
+            f"{self.REQUEST_RETRY_INTERVAL:.1f}s"
+        )
+
+        self.get_logger().info(
             "================================="
         )
 
 
         # 처음 생성된 Queue 출력
         for cell in self.cells.values():
+
             cell.print_queue()
 
 
@@ -129,11 +162,9 @@ class AssemblyNode(Node):
 
         for cell_id, cell in self.cells.items():
 
+
             # =================================================
             # Cell 상태 업데이트
-            #
-            # PROCESSING이면 작업 시간 체크
-            # WAITING이면 그냥 대기
             # =================================================
 
             completed_task = cell.update(
@@ -154,48 +185,176 @@ class AssemblyNode(Node):
                 )
 
 
-                # AssemblyCell 내부에서
-                # 이미 새로운 랜덤 Task가 생성되어
-                # Queue는 다시 3개가 되어 있음
-
+                # 새로운 Task가 Queue 뒤에 자동 추가됨
                 cell.print_queue()
 
 
                 # =================================================
-                # 이제 Queue 맨 앞이 새로운 현재 작업이므로
-                # FMS에 다시 요청할 수 있도록 초기화
+                # Queue의 맨 앞 Task가 바뀌었으므로
+                # 요청 기록 초기화
                 # =================================================
 
-                self.request_sent[cell_id] = False
+                self.last_request_task_id[
+                    cell_id
+                ] = None
+
+
+                self.last_request_time[
+                    cell_id
+                ] = (
+                    self.simulation_time
+                    - self.REQUEST_RETRY_INTERVAL
+                )
 
 
             # =================================================
-            # WAITING_FOR_PART 상태라면
-            # 필요한 부품을 FMS에 요청
+            # WAITING_FOR_PART
+            #
+            # 필요한 부품이 아직 도착하지 않았다면
+            # FMS에 요청
             # =================================================
 
             if (
-                cell.state == cell.WAITING_FOR_PART
-                and not self.request_sent[cell_id]
+                cell.state
+                == cell.WAITING_FOR_PART
             ):
 
-                self.send_request_to_fms(
+                self.check_and_send_request(
                     cell_id,
                     cell
                 )
 
 
     # ========================================================
-    # FMS로 부품 요청
+    # FMS 요청 여부 확인
     # ========================================================
 
-    def send_request_to_fms(self, cell_id, cell):
+    def check_and_send_request(
+        self,
+        cell_id,
+        cell,
+    ):
 
-        # Queue 맨 앞 Task 확인
         task = cell.get_next_task()
 
 
         if task is None:
+
+            return
+
+
+        # ====================================================
+        # 새로운 Task가 Queue 맨 앞으로 온 경우
+        #
+        # 즉시 요청할 수 있도록 시간 초기화
+        # ====================================================
+
+        if (
+            self.last_request_task_id[cell_id]
+            != task.task_id
+        ):
+
+            self.last_request_task_id[
+                cell_id
+            ] = task.task_id
+
+
+            self.last_request_time[
+                cell_id
+            ] = (
+                self.simulation_time
+                - self.REQUEST_RETRY_INTERVAL
+            )
+
+
+        # ====================================================
+        # 아직 재전송 시간이 안 됐다면 대기
+        # ====================================================
+
+        elapsed = (
+            self.simulation_time
+            - self.last_request_time[cell_id]
+        )
+
+
+        if (
+            elapsed
+            < self.REQUEST_RETRY_INTERVAL
+        ):
+
+            return
+
+
+        # ====================================================
+        # FMS Subscriber 연결 확인
+        #
+        # FMS가 아직 /assembly/request에 붙지 않았다면
+        # 메시지를 보내지 않음
+        #
+        # 기존 코드의 핵심 문제였던
+        # "FMS가 준비되기 전에 한 번 보내고 끝"
+        # 상황 방지
+        # ====================================================
+
+        subscriber_count = (
+            self.request_publisher
+            .get_subscription_count()
+        )
+
+
+        if subscriber_count == 0:
+
+            if not self.waiting_for_fms_logged:
+
+                self.get_logger().warning(
+                    "[FMS WAIT] "
+                    "/assembly/request subscriber가 "
+                    "아직 없습니다. "
+                    "FMS 연결을 기다립니다."
+                )
+
+                self.waiting_for_fms_logged = True
+
+
+            return
+
+
+        # FMS 연결 확인됨
+        self.waiting_for_fms_logged = False
+
+
+        # ====================================================
+        # 실제 FMS 요청
+        # ====================================================
+
+        self.send_request_to_fms(
+            cell_id,
+            cell
+        )
+
+
+        # 마지막 전송 시간 기록
+        self.last_request_time[
+            cell_id
+        ] = self.simulation_time
+
+
+    # ========================================================
+    # FMS로 부품 요청
+    # ========================================================
+
+    def send_request_to_fms(
+        self,
+        cell_id,
+        cell,
+    ):
+
+        # Queue 맨 앞 Task
+        task = cell.get_next_task()
+
+
+        if task is None:
+
             return
 
 
@@ -225,11 +384,9 @@ class AssemblyNode(Node):
         msg.data = request
 
 
-        self.request_publisher.publish(msg)
-
-
-        # 중복 요청 방지
-        self.request_sent[cell_id] = True
+        self.request_publisher.publish(
+            msg
+        )
 
 
         self.get_logger().info(
@@ -244,25 +401,22 @@ class AssemblyNode(Node):
     # AMR 부품 도착 Callback
     # ========================================================
 
-    def part_arrived_callback(self, msg):
+    def part_arrived_callback(
+        self,
+        msg,
+    ):
 
         # ====================================================
         # 예상 메시지
         #
         # cell_id=A
-        #
-        # 나중에는:
-        #
-        # cell_id=A,amr_id=AMR_1
-        #
-        # 같은 형식으로 확장 가능
         # ====================================================
 
         data = msg.data.strip()
 
 
         # ====================================================
-        # 문자열에서 cell_id 추출
+        # cell_id 추출
         # ====================================================
 
         cell_id = None
@@ -270,17 +424,30 @@ class AssemblyNode(Node):
 
         for item in data.split(","):
 
-            key_value = item.split("=")
+            key_value = item.split(
+                "=",
+                1,
+            )
+
 
             if len(key_value) != 2:
+
                 continue
 
 
-            key = key_value[0].strip()
-            value = key_value[1].strip()
+            key = (
+                key_value[0]
+                .strip()
+            )
+
+            value = (
+                key_value[1]
+                .strip()
+            )
 
 
             if key == "cell_id":
+
                 cell_id = value
 
 
@@ -291,7 +458,8 @@ class AssemblyNode(Node):
         if cell_id is None:
 
             self.get_logger().warning(
-                f"잘못된 도착 메시지: {msg.data}"
+                f"잘못된 도착 메시지: "
+                f"{msg.data}"
             )
 
             return
@@ -300,13 +468,16 @@ class AssemblyNode(Node):
         if cell_id not in self.cells:
 
             self.get_logger().warning(
-                f"존재하지 않는 Cell: {cell_id}"
+                f"존재하지 않는 Cell: "
+                f"{cell_id}"
             )
 
             return
 
 
-        cell = self.cells[cell_id]
+        cell = self.cells[
+            cell_id
+        ]
 
 
         # ====================================================
@@ -329,11 +500,19 @@ class AssemblyNode(Node):
                 f"{task.shape} 부품 도착"
             )
 
+
             self.get_logger().info(
                 f"[PROCESSING] "
                 f"Cell {cell_id} - "
-                f"{task.processing_time:.0f}초 작업 시작"
+                f"{task.processing_time:.0f}초 "
+                f"작업 시작"
             )
+
+
+            # =================================================
+            # PROCESSING 상태가 되었으므로
+            # update()에서 더 이상 FMS 요청을 보내지 않음
+            # =================================================
 
 
         else:
@@ -346,14 +525,19 @@ class AssemblyNode(Node):
 
 def main(args=None):
 
-    rclpy.init(args=args)
+    rclpy.init(
+        args=args
+    )
+
 
     node = AssemblyNode()
 
 
     try:
 
-        rclpy.spin(node)
+        rclpy.spin(
+            node
+        )
 
 
     except KeyboardInterrupt:
@@ -365,8 +549,12 @@ def main(args=None):
 
         node.destroy_node()
 
-        rclpy.shutdown()
+
+        if rclpy.ok():
+
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
+
     main()

@@ -8,7 +8,6 @@ from collections import deque
 from typing import Sequence
 
 import rclpy
-
 from rclpy.node import Node
 from std_msgs.msg import String
 
@@ -43,24 +42,36 @@ class Scenario0FMSNode(Node):
     # AMR 상태 이벤트
     AMR_STATUS_TOPIC = "/amr/status"
 
+    # 완료로 간주할 상태
+    FINISHED_STATUSES = {
+        "DELIVERY_COMPLETE",
+        "MISSION_COMPLETE",
+    }
 
     def __init__(self) -> None:
 
-        super().__init__(
-            "scenario0_fms"
-        )
-
+        super().__init__("scenario0_fms")
 
         # =================================================
         # FMS Task Queue
         #
-        # 실제 E2E에서는 Assembly 요청으로 채워짐
+        # 아직 AMR에 할당되지 않은 waiting task
         # =================================================
 
         self.task_queue: deque[Task] = deque(
             maxlen=self.QUEUE_CAPACITY
         )
 
+        # =================================================
+        # Active Task Registry
+        #
+        # 이미 어떤 AMR에 할당된 작업을 저장
+        #
+        # key   : task_id
+        # value : Task
+        # =================================================
+
+        self.active_tasks: dict[str, Task] = {}
 
         # =================================================
         # 마지막 최적화 결과
@@ -68,40 +79,20 @@ class Scenario0FMSNode(Node):
 
         self.latest_plan: OptimizationResult | None = None
 
-
         # =================================================
         # cuOpt 실행 중 여부
         # =================================================
 
         self.is_optimizing = False
 
-
         # =================================================
         # AMR 상태 저장
-        #
-        # key:
-        #   AMR_01
-        #
-        # value:
-        #   {
-        #       "state": ...,
-        #       "status": ...,
-        #       "current_task_id": ...,
-        #       "load_state": ...
-        #   }
-        #
-        # 상태 이벤트가 들어올 때만 갱신
         # =================================================
 
-        self.amr_states: dict[
-            str,
-            dict[str, str],
-        ] = {}
-
+        self.amr_states: dict[str, dict[str, str]] = {}
 
         # =================================================
         # Assembly -> FMS
-        #
         # Task 요청
         # =================================================
 
@@ -112,112 +103,100 @@ class Scenario0FMSNode(Node):
             self.QUEUE_CAPACITY,
         )
 
-
         # =================================================
         # AMR -> FMS
-        #
         # AMR 상태 변화 Event
         # =================================================
 
-        self.amr_status_subscription = (
-            self.create_subscription(
-                String,
-                self.AMR_STATUS_TOPIC,
-                self.amr_status_callback,
-                10,
-            )
+        self.amr_status_subscription = self.create_subscription(
+            String,
+            self.AMR_STATUS_TOPIC,
+            self.amr_status_callback,
+            10,
         )
-
 
         # =================================================
         # AMR -> FMS
-        #
         # Pull 방식 Task 요청
         # =================================================
 
-        self.task_request_service = (
-            self.create_service(
-                RequestTask,
-                self.TASK_REQUEST_SERVICE,
-                self.request_task_callback,
-            )
+        self.task_request_service = self.create_service(
+            RequestTask,
+            self.TASK_REQUEST_SERVICE,
+            self.request_task_callback,
         )
-
 
         # =================================================
         # 시작 로그
         # =================================================
 
+        self.get_logger().info("=================================")
+        self.get_logger().info("Scenario 0 FMS started")
         self.get_logger().info(
-            "================================="
+            f"Assembly Topic : {self.TASK_REQUEST_TOPIC}"
         )
-
         self.get_logger().info(
-            "Scenario 0 FMS started"
+            f"Task Service   : {self.TASK_REQUEST_SERVICE}"
         )
-
         self.get_logger().info(
-            f"Assembly Topic : "
-            f"{self.TASK_REQUEST_TOPIC}"
+            f"AMR Status     : {self.AMR_STATUS_TOPIC}"
         )
-
-        self.get_logger().info(
-            f"Task Service   : "
-            f"{self.TASK_REQUEST_SERVICE}"
-        )
-
-        self.get_logger().info(
-            f"AMR Status     : "
-            f"{self.AMR_STATUS_TOPIC}"
-        )
-
-        self.get_logger().info(
-            "Task Queue     : EMPTY"
-        )
-
-        self.get_logger().info(
-            "================================="
-        )
-
+        self.get_logger().info("Task Queue     : EMPTY")
+        self.get_logger().info("=================================")
 
     # =====================================================
     # 문자열 key=value 메시지 Parser
     # =====================================================
 
     @staticmethod
-    def parse_key_value_message(
-        data: str,
-    ) -> dict[str, str]:
+    def parse_key_value_message(data: str) -> dict[str, str]:
 
         result: dict[str, str] = {}
-
 
         for item in data.split(","):
 
             item = item.strip()
 
-
             if not item:
                 continue
-
 
             if "=" not in item:
                 continue
 
-
-            key, value = item.split(
-                "=",
-                1,
-            )
-
-
-            result[
-                key.strip()
-            ] = value.strip()
-
+            key, value = item.split("=", 1)
+            result[key.strip()] = value.strip()
 
         return result
 
+    # =====================================================
+    # Queue에 동일 task_id가 있는지 확인
+    # =====================================================
+
+    def is_task_in_queue(self, task_id: str) -> bool:
+
+        return any(
+            queued.task_id == task_id
+            for queued in self.task_queue
+        )
+
+    # =====================================================
+    # Active Task인지 확인
+    # =====================================================
+
+    def is_task_active(self, task_id: str) -> bool:
+
+        return task_id in self.active_tasks
+
+    # =====================================================
+    # Queue 상태 로그
+    # =====================================================
+
+    def log_queue_summary(self) -> None:
+
+        self.get_logger().info(
+            f"[QUEUE] waiting={len(self.task_queue)} "
+            f"active={len(self.active_tasks)}"
+        )
 
     # =====================================================
     # Assembly -> FMS
@@ -235,44 +214,24 @@ class Scenario0FMSNode(Node):
     # 현재 Assembly에는 아직
     # urgency / requested_at / deadline이 없으므로
     # Scenario 0 기본값을 임시 적용
-    #
-    # 향후 custom interface에서 실제 값으로 교체
     # =====================================================
 
-    def task_request_callback(
-        self,
-        message: String,
-    ) -> None:
+    def task_request_callback(self, message: String) -> None:
 
         try:
 
-            fields = (
-                self.parse_key_value_message(
-                    message.data
-                )
+            fields = self.parse_key_value_message(
+                message.data
             )
-
 
             # =============================================
             # 필수 값 확인
             # =============================================
 
-            cell_id = fields.get(
-                "cell_id"
-            )
-
-            task_id = fields.get(
-                "task_id"
-            )
-
-            kit_id = fields.get(
-                "kit_id"
-            )
-
-            processing_time = fields.get(
-                "processing_time"
-            )
-
+            cell_id = fields.get("cell_id")
+            task_id = fields.get("task_id")
+            kit_id = fields.get("kit_id")
+            processing_time = fields.get("processing_time")
 
             if (
                 cell_id is None
@@ -280,147 +239,78 @@ class Scenario0FMSNode(Node):
                 or kit_id is None
                 or processing_time is None
             ):
-
                 raise ValueError(
                     "Assembly request requires "
-                    "cell_id, task_id, kit_id, "
-                    "processing_time."
+                    "cell_id, task_id, kit_id, processing_time."
                 )
-
 
             # =============================================
             # Cell 이름 통일
-            #
             # A -> cell_a
-            # B -> cell_b
-            # C -> cell_c
             # =============================================
 
-            delivery_cell = (
-                f"cell_{cell_id.lower()}"
-            )
-
+            delivery_cell = f"cell_{cell_id.lower()}"
 
             # =============================================
             # Scenario 0 임시 metadata
-            #
-            # 현재 Assembly 메시지에는 아직
-            # 아래 값들이 없음.
-            #
-            # 추후 Assembly/FMS custom message에서
-            # 실제 값으로 전달하도록 변경 예정.
             # =============================================
 
-            urgency = int(
-                fields.get(
-                    "urgency",
-                    1,
-                )
-            )
-
+            urgency = int(fields.get("urgency", 1))
 
             requested_at = int(
-                fields.get(
-                    "requested_at",
-                    int(time.monotonic()),
-                )
+                fields.get("requested_at", int(time.monotonic()))
             )
-
 
             deadline = int(
-                fields.get(
-                    "deadline",
-                    requested_at + 600,
-                )
+                fields.get("deadline", requested_at + 600)
             )
-
 
             # =============================================
             # Task 생성
             # =============================================
 
             task = Task(
-                task_id=str(
-                    task_id
-                ),
-
-                kit_id=str(
-                    kit_id
-                ),
-
-                delivery_cell=(
-                    delivery_cell
-                ),
-
+                task_id=str(task_id),
+                kit_id=str(kit_id),
+                delivery_cell=delivery_cell,
                 urgency=urgency,
-
-                requested_at=(
-                    requested_at
-                ),
-
+                requested_at=requested_at,
                 deadline=deadline,
-
-                processing_time=float(
-                    processing_time
-                ),
+                processing_time=float(processing_time),
             )
 
+            self.add_task(task)
 
-            self.add_task(
-                task
-            )
-
-
-        except (
-            ValueError,
-            OverflowError,
-        ) as error:
+        except (ValueError, OverflowError) as error:
 
             self.get_logger().warning(
-                f"Rejected Assembly Task: "
-                f"{error}"
+                f"Rejected Assembly Task: {error}"
             )
-
             return
-
 
         self.get_logger().info(
             f"[TASK QUEUED] "
-            f"{task.task_id} "
-            f"{task.kit_id} "
-            f"-> {task.delivery_cell} "
-            f"(processing="
-            f"{task.processing_time:.1f}s) "
-            f"queue="
-            f"{len(self.task_queue)}/"
-            f"{self.QUEUE_CAPACITY}"
+            f"{task.task_id} {task.kit_id} -> {task.delivery_cell} "
+            f"(processing={task.processing_time:.1f}s) "
+            f"queue={len(self.task_queue)}/{self.QUEUE_CAPACITY}"
         )
 
+        self.log_queue_summary()
 
     # =====================================================
     # Task Queue 추가
     # =====================================================
 
-    def add_task(
-        self,
-        task: Task,
-    ) -> None:
+    def add_task(self, task: Task) -> None:
 
         # =================================================
         # Queue Full
         # =================================================
 
-        if (
-            len(self.task_queue)
-            >= self.QUEUE_CAPACITY
-        ):
-
+        if len(self.task_queue) >= self.QUEUE_CAPACITY:
             raise OverflowError(
-                "Task queue is full "
-                f"(capacity="
-                f"{self.QUEUE_CAPACITY})."
+                f"Task queue is full (capacity={self.QUEUE_CAPACITY})."
             )
-
 
         # =================================================
         # Cell 확인
@@ -431,117 +321,93 @@ class Scenario0FMSNode(Node):
             "cell_b",
             "cell_c",
         }:
-
             raise ValueError(
-                f"Unknown Assembly Cell: "
-                f"{task.delivery_cell}"
+                f"Unknown Assembly Cell: {task.delivery_cell}"
             )
-
 
         # =================================================
         # 중복 Task 방지
+        #
+        # 1) waiting queue 안에 이미 있으면 무시
+        # 2) active_tasks 안에 이미 있으면 무시
+        #
+        # Assembly가 같은 task_id를
+        # 재전송할 수 있으므로 반드시 필요
         # =================================================
 
-        if any(
-            queued.task_id
-            == task.task_id
-
-            for queued
-            in self.task_queue
-        ):
-
+        if self.is_task_in_queue(task.task_id):
             raise ValueError(
-                f"Duplicate task_id: "
+                f"Duplicate task_id already in waiting queue: "
                 f"{task.task_id}"
             )
 
+        if self.is_task_active(task.task_id):
+            raise ValueError(
+                f"Duplicate task_id already active: "
+                f"{task.task_id}"
+            )
 
-        self.task_queue.append(
-            task
-        )
-
+        self.task_queue.append(task)
 
     # =====================================================
     # AMR 상태 Event 수신
     #
     # 예:
-    #
-    # amr_id=AMR_01,
-    # state=BUSY,
-    # status=MOVING_TO_DELIVERY,
-    # task_id=17,
-    # load_state=LOADED
-    #
-    # polling하지 않고
-    # Event가 들어올 때만 마지막 상태 갱신
+    # amr_id=AMR_01,state=BUSY,status=MOVING_TO_DELIVERY,
+    # task_id=17,load_state=LOADED
     # =====================================================
 
-    def amr_status_callback(
-        self,
-        message: String,
-    ) -> None:
+    def amr_status_callback(self, message: String) -> None:
 
-        fields = (
-            self.parse_key_value_message(
-                message.data
-            )
-        )
+        fields = self.parse_key_value_message(message.data)
 
-
-        amr_id = fields.get(
-            "amr_id"
-        )
-
+        amr_id = fields.get("amr_id")
 
         if not amr_id:
-
             self.get_logger().warning(
-                f"Invalid AMR status: "
-                f"{message.data}"
+                f"Invalid AMR status: {message.data}"
             )
-
             return
 
+        state = fields.get("state", "")
+        status = fields.get("status", "")
+        task_id = fields.get("task_id", "")
+        load_state = fields.get("load_state", "")
 
-        self.amr_states[
-            amr_id
-        ] = {
-
-            "state": fields.get(
-                "state",
-                "",
-            ),
-
-            "status": fields.get(
-                "status",
-                "",
-            ),
-
-            "current_task_id": fields.get(
-                "task_id",
-                "",
-            ),
-
-            "load_state": fields.get(
-                "load_state",
-                "",
-            ),
+        self.amr_states[amr_id] = {
+            "state": state,
+            "status": status,
+            "current_task_id": task_id,
+            "load_state": load_state,
         }
-
 
         self.get_logger().info(
             f"[AMR EVENT] "
             f"{amr_id} "
-            f"state="
-            f"{self.amr_states[amr_id]['state']} "
-            f"status="
-            f"{self.amr_states[amr_id]['status']} "
-            f"task="
-            f"{self.amr_states[amr_id]['current_task_id'] or '-'} "
-            f"load="
-            f"{self.amr_states[amr_id]['load_state']}"
+            f"state={state} "
+            f"status={status} "
+            f"task={task_id or '-'} "
+            f"load={load_state}"
         )
 
+        # =================================================
+        # 작업 완료 이벤트면 active registry에서 제거
+        # =================================================
+
+        if (
+            task_id
+            and task_id != "-"
+            and status in self.FINISHED_STATUSES
+        ):
+            if task_id in self.active_tasks:
+                finished_task = self.active_tasks.pop(task_id)
+
+                self.get_logger().info(
+                    f"[TASK FINISHED] "
+                    f"{finished_task.task_id} removed from active registry"
+                )
+
+                self.log_queue_summary()
 
     # =====================================================
     # AMR -> FMS
@@ -561,159 +427,80 @@ class Scenario0FMSNode(Node):
             f"[TASK REQUEST] "
             f"{request.amr_id} "
             f"state={request.state} "
-            f"position="
-            f"({request.x:.2f}, "
-            f"{request.y:.2f}) "
-            f"load="
-            f"{request.load_state}"
+            f"position=({request.x:.2f}, {request.y:.2f}) "
+            f"load={request.load_state}"
         )
 
-
         # =================================================
-        # Request 자체를 AMR 최신 상태로 반영
+        # Request 자체를 최신 상태로 반영
         # =================================================
 
-        self.amr_states[
-            request.amr_id
-        ] = {
-
-            "state": (
-                request.state
-            ),
-
-            "status": (
-                "REQUESTING_TASK"
-            ),
-
-            "current_task_id": (
-                request.current_task_id
-            ),
-
-            "load_state": (
-                request.load_state
-            ),
+        self.amr_states[request.amr_id] = {
+            "state": request.state,
+            "status": "REQUESTING_TASK",
+            "current_task_id": request.current_task_id,
+            "load_state": request.load_state,
         }
-
 
         # =================================================
         # 대기 Task 없음
         # =================================================
 
         if not self.task_queue:
-
             response.has_task = False
-
-            response.message = (
-                "No waiting task."
-            )
-
+            response.message = "No waiting task."
 
             self.get_logger().info(
-                f"[NO TASK] "
-                f"{request.amr_id}"
+                f"[NO TASK] {request.amr_id}"
             )
-
-
             return response
-
 
         # =================================================
         # 이미 cuOpt 실행 중
         # =================================================
 
         if self.is_optimizing:
-
             response.has_task = False
-
             response.message = (
-                "Optimization is already "
-                "in progress."
+                "Optimization is already in progress."
             )
-
             return response
-
 
         # =================================================
         # 현재 AMR 상태 생성
-        #
-        # AMR이 직접 보낸 현재 상태/위치를 사용
         # =================================================
 
         amr_state = AMRState(
-
-            amr_id=(
-                request.amr_id
-            ),
-
-            state=(
-                request.state
-            ),
-
-            x=float(
-                request.x
-            ),
-
-            y=float(
-                request.y
-            ),
-
-            # 현재 RequestTask.srv에는
-            # yaw가 없으므로 Scenario 0에서는
-            # 0으로 가정
-            yaw=0.0,
-
-            load_state=(
-                request.load_state
-            ),
-
-            current_task_id=(
-                request.current_task_id
-            ),
+            amr_id=request.amr_id,
+            state=request.state,
+            x=float(request.x),
+            y=float(request.y),
+            yaw=0.0,  # 현재 RequestTask.srv에는 yaw 없음
+            load_state=request.load_state,
+            current_task_id=request.current_task_id,
         )
 
-
         # =================================================
-        # 현재 Queue 전체를 cuOpt에 전달
+        # 현재 waiting queue 전체를 cuOpt에 전달
         # =================================================
 
-        tasks = list(
-            self.task_queue
-        )
-
-
+        tasks = list(self.task_queue)
         self.is_optimizing = True
 
-
         self.get_logger().info(
-            f"[CUOPT] "
-            f"Sending "
-            f"{len(tasks)} tasks "
-            f"for {request.amr_id}"
+            f"[CUOPT] Sending {len(tasks)} tasks for {request.amr_id}"
         )
-
 
         try:
 
-            optimization_request = (
-                OptimizationRequest(
-
-                    tasks=tuple(
-                        tasks
-                    ),
-
-                    amr_state=(
-                        amr_state
-                    ),
-                )
+            optimization_request = OptimizationRequest(
+                tasks=tuple(tasks),
+                amr_state=amr_state,
             )
 
-
-            self.latest_plan = (
-                CuOptSolver(
-                    optimization_request
-                ).solve()
-            )
-
+            self.latest_plan = CuOptSolver(
+                optimization_request
+            ).solve()
 
             # =============================================
             # cuOpt 결과 확인
@@ -721,289 +508,145 @@ class Scenario0FMSNode(Node):
 
             if (
                 not self.latest_plan.success
-                or
-                not self.latest_plan.ordered_tasks
+                or not self.latest_plan.ordered_tasks
             ):
-
                 response.has_task = False
-
-                response.message = (
-                    self.latest_plan.message
-                )
-
+                response.message = self.latest_plan.message
                 return response
-
 
             self.get_logger().info(
                 "=== Optimized Task Order ==="
             )
 
-
-            for ordered_task in (
-                self.latest_plan.ordered_tasks
-            ):
-
+            for ordered_task in self.latest_plan.ordered_tasks:
                 self.get_logger().info(
                     f"{ordered_task.sequence:02d}. "
-                    f"{ordered_task.task_id} "
-                    f"-> "
+                    f"{ordered_task.task_id} -> "
                     f"{ordered_task.delivery_cell}"
                 )
 
-
             # =============================================
-            # cuOpt 결과의 첫 번째 Task를
-            # 현재 요청한 AMR에 할당
+            # 첫 번째 Task 선택
             # =============================================
 
-            selected_order = (
-                self.latest_plan
-                .ordered_tasks[0]
-            )
-
+            selected_order = self.latest_plan.ordered_tasks[0]
 
             selected_task = next(
-
                 task
-
                 for task in tasks
-
-                if (
-                    task.task_id
-                    == selected_order.task_id
-                )
+                if task.task_id == selected_order.task_id
             )
-
 
             # =============================================
-            # FMS Location DB
-            #
-            # cuOpt Logical Location
-            #      ↓
-            # FMS
-            #      ↓
-            # Physical Coordinate
+            # logical location -> physical coordinate
             # =============================================
 
-            pickup_location = (
-                PARTS_SUPERMARKET
-            )
-
-
-            delivery_location = (
-                LOCATION_BY_ID[
-                    selected_task.delivery_cell
-                ]
-            )
-
+            pickup_location = PARTS_SUPERMARKET
+            delivery_location = LOCATION_BY_ID[
+                selected_task.delivery_cell
+            ]
 
             # =============================================
             # AMR Response
             # =============================================
 
             response.has_task = True
-
-
-            response.task_id = (
-                selected_task.task_id
-            )
-
-
-            response.kit_id = (
-                selected_task.kit_id
-            )
-
-
+            response.task_id = selected_task.task_id
+            response.kit_id = selected_task.kit_id
             response.processing_time = float(
                 selected_task.processing_time
             )
 
-
-            # =============================================
             # Pickup
-            # =============================================
+            response.pickup_id = pickup_location.location_id
+            response.pickup_x = float(pickup_location.x)
+            response.pickup_y = float(pickup_location.y)
 
-            response.pickup_id = (
-                pickup_location.location_id
-            )
-
-
-            response.pickup_x = float(
-                pickup_location.x
-            )
-
-
-            response.pickup_y = float(
-                pickup_location.y
-            )
-
-
-            # =============================================
             # Delivery
-            # =============================================
-
-            response.delivery_id = (
-                delivery_location.location_id
-            )
-
-
-            response.delivery_x = float(
-                delivery_location.x
-            )
-
-
-            response.delivery_y = float(
-                delivery_location.y
-            )
-
+            response.delivery_id = delivery_location.location_id
+            response.delivery_x = float(delivery_location.x)
+            response.delivery_y = float(delivery_location.y)
 
             response.message = (
-                f"Assigned "
-                f"{selected_task.task_id} "
-                f"to "
-                f"{request.amr_id}"
+                f"Assigned {selected_task.task_id} "
+                f"to {request.amr_id}"
             )
-
 
             # =============================================
             # Task 상태 변경
             # =============================================
 
-            selected_task.status = (
-                "ASSIGNED"
-            )
-
+            selected_task.status = "ASSIGNED"
 
             # =============================================
-            # 현재 Scenario 0에서는
-            # AMR 한 대가 한 Task씩 Pull하므로
-            # Queue에서 할당된 Task 제거
-            #
-            # 추후 실패 복구 / 재할당을 넣을 때는
-            # 별도 Active Task Registry로
-            # 이동시키는 구조로 확장 가능
+            # waiting queue -> active_tasks 이동
             # =============================================
 
-            self.task_queue.remove(
-                selected_task
-            )
-
+            self.task_queue.remove(selected_task)
+            self.active_tasks[selected_task.task_id] = selected_task
 
             # =============================================
             # FMS AMR 상태 갱신
             # =============================================
 
-            self.amr_states[
-                request.amr_id
-            ] = {
-
+            self.amr_states[request.amr_id] = {
                 "state": "BUSY",
-
-                "status": (
-                    "TASK_ASSIGNED"
-                ),
-
-                "current_task_id": (
-                    selected_task.task_id
-                ),
-
-                "load_state": (
-                    request.load_state
-                ),
+                "status": "TASK_ASSIGNED",
+                "current_task_id": selected_task.task_id,
+                "load_state": request.load_state,
             }
-
 
             self.get_logger().info(
                 f"[TASK ASSIGNED] "
-                f"{selected_task.task_id} "
-                f"-> {request.amr_id}"
+                f"{selected_task.task_id} -> {request.amr_id}"
             )
-
 
             self.get_logger().info(
-                f"Pickup   : "
-                f"{pickup_location.location_id} "
-                f"({pickup_location.x:.2f}, "
-                f"{pickup_location.y:.2f})"
+                f"Pickup   : {pickup_location.location_id} "
+                f"({pickup_location.x:.2f}, {pickup_location.y:.2f})"
             )
-
 
             self.get_logger().info(
-                f"Delivery : "
-                f"{delivery_location.location_id} "
-                f"({delivery_location.x:.2f}, "
-                f"{delivery_location.y:.2f})"
+                f"Delivery : {delivery_location.location_id} "
+                f"({delivery_location.x:.2f}, {delivery_location.y:.2f})"
             )
 
-
-            self.get_logger().info(
-                f"Remaining Queue: "
-                f"{len(self.task_queue)}"
-            )
-
+            self.log_queue_summary()
 
             return response
-
 
         except Exception as error:
 
             response.has_task = False
-
-            response.message = str(
-                error
-            )
-
+            response.message = str(error)
 
             self.get_logger().error(
-                f"cuOpt optimization failed: "
-                f"{error}"
+                f"cuOpt optimization failed: {error}"
             )
-
-
             return response
 
-
         finally:
-
             self.is_optimizing = False
 
 
-def main(
-    args: Sequence[str] | None = None,
-) -> None:
+def main(args: Sequence[str] | None = None) -> None:
 
-    rclpy.init(
-        args=args
-    )
+    rclpy.init(args=args)
 
-
-    node = (
-        Scenario0FMSNode()
-    )
-
+    node = Scenario0FMSNode()
 
     try:
-
-        rclpy.spin(
-            node
-        )
-
+        rclpy.spin(node)
 
     except KeyboardInterrupt:
-
         pass
 
-
     finally:
-
         node.destroy_node()
 
-
         if rclpy.ok():
-
             rclpy.shutdown()
 
 
 if __name__ == "__main__":
-
     main()
