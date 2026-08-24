@@ -43,8 +43,15 @@ Isaac Sim /amr/odom
 - `amr_node.py`가 FMS 작업 요청, 상태 발행, Isaac odom 수신 및 Nav2 주행을
   모두 담당한다. 검증용 `amr_withnav2.py`와 동시에 실행하지 않는다.
 - 기존 `/compute_path_to_pose` 및 `/amr/path_command` 방식은 제거했다.
-- 작업 수행 중 AMR이 1초마다 `POSITION_UPDATE` 이벤트와 Isaac Sim odom
-  좌표를 `/amr/status`로 보고하도록 추가했다.
+- AMR 상태는 상태 전환 시 이벤트로 전달하며, 당시 Isaac Sim odom 좌표를
+  함께 담는다. 주행 중 1초 단위 `POSITION_UPDATE`는 제거했다.
+- `AMRStatus.timestamp`에는 시스템 시계 기준으로 AMR이 상태 데이터를 패킹한
+  시각을 기록한다.
+  FMS는 AMR별 최신 timestamp보다 오래된 상태를 무시하고 기존 상태 객체의
+  필드를 직접 갱신한다.
+- Nav2 목적지는 작업 스레드와 블로킹 대기 대신 Action Future 콜백으로 순차
+  처리하며, 로딩 대기도 `sleep` 대신 ROS timer를 사용한다.
+- ROS 콜백 처리는 `MultiThreadedExecutor`의 두 스레드로 유지한다.
 - Delivery 도착 시 상태와 이벤트가 모두 `ARRIVED_DELIVERY`가 되도록 상태
   전이를 정리했다.
 - FMS는 `AMRRuntimeState`를 `amr_id`별로 생성해 여러 AMR의 최신 상태와
@@ -55,6 +62,14 @@ Isaac Sim /amr/odom
   기준 상대시간으로 기록한다.
 - Scenario 0 정책에 따라 할당된 작업은 응답 시 대기 큐에서 제거하며, Nav2
   시간 초과 시 goal을 자동 취소하지 않는다.
+- AMR은 `IDLE`이고 실행 중이거나 응답 대기 중인 작업이 없을 때 1초 주기의
+  Timer로 FMS에 다음 작업을 요청한다.
+- `RequestTask`의 고정 Pickup/Delivery 필드를 `Location[] destinations`로
+  변경했다. FMS는 논리 위치와 물리 좌표를 묶어 실행 순서대로 반환하고,
+  AMR은 목록을 순회하며 각 위치를 `NavigateToPose`로 순차 처리한다.
+- `Location`은 `name`, `x`, `y`, `yaw`로만 구성한다. `name` 값은
+  `AMR_START`, `PARTS_SUPERMARKET`, `ASSEMBLY_CELL_A/B/C`를 사용하며 ROS
+  메시지 안에는 별도의 위치 상수를 중복 정의하지 않는다.
 - `navigation`은 독립 ROS 2 패키지이므로 빌드 후 워크스페이스를 source한다.
 - Nav2와 Isaac Sim은 동일한 `ROS_DOMAIN_ID`를 사용해야 한다.
 
@@ -71,3 +86,13 @@ Isaac Sim /amr/odom
   있도록 했다.
 - `nav2.launch.py`의 `map`과 `params_file` 기본값을 각각 패키지 내부의
   `maps/factory_map.yaml`, `config/nav2_params.yaml`로 연결했다.
+
+
+
+
+## 향후 구현 기능
+
+- FMS가 10초마다 가동 중인 AMR의 상태를 조회하는 Heartbeat를 구현한다.
+- FMS에서 AMR별 마지막 응답 시각과 `ONLINE`/`OFFLINE` 통신 상태를 관리한다.
+- 긴급 작업 발생 시 전체 AMR의 상태를 조회하고 적합한 AMR을 선정한다.
+- AMR 장애나 긴급도 변경에 따른 작업 예약 및 재할당 정책을 구현한다.

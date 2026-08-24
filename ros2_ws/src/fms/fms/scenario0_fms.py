@@ -13,7 +13,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from interfaces.msg import AMRStatus
+from interfaces.msg import AMRStatus, Location as LocationMessage
 from interfaces.srv import RequestTask
 
 from fms.defined import (
@@ -39,6 +39,7 @@ class AMRRuntimeState:
     kit_id: str = ""
     x: float = 0.0
     y: float = 0.0
+    timestamp_ns: int = -1
 
 
 class Scenario0FMSNode(Node):
@@ -57,6 +58,16 @@ class Scenario0FMSNode(Node):
 
     # AMR 상태 이벤트
     AMR_STATUS_TOPIC = "/amr/status"
+
+    @staticmethod
+    def to_location_message(location) -> LocationMessage:
+        """Convert an FMS domain Location into its ROS message form."""
+        message = LocationMessage()
+        message.name = location.name
+        message.x = float(location.x)
+        message.y = float(location.y)
+        message.yaw = float(location.yaw)
+        return message
 
 
     def __init__(self) -> None:
@@ -112,6 +123,7 @@ class Scenario0FMSNode(Node):
         # =================================================
 
         self.amr_states: dict[str, AMRRuntimeState] = {}
+        self.amr_last_seen: dict[str, float] = {}
 
 
         # =================================================
@@ -150,13 +162,13 @@ class Scenario0FMSNode(Node):
         # Pull 방식 Task 요청
         # =================================================
 
-        self.task_request_service = (
+        self.task_request_service = \
             self.create_service(
                 RequestTask,
                 self.TASK_REQUEST_SERVICE,
                 self.request_task_callback,
             )
-        )
+
 
 
         # =================================================
@@ -492,16 +504,39 @@ class Scenario0FMSNode(Node):
 
             return
 
-
-        self.amr_states[amr_id] = AMRRuntimeState(
-            state=message.state,
-            status=message.event,
-            current_task_id=message.task_id,
-            load_state=message.load_state,
-            kit_id=message.kit_id,
-            x=float(message.x),
-            y=float(message.y),
+        # Receiving even an older snapshot proves that the AMR is reachable.
+        self.amr_last_seen[amr_id] = time.monotonic()
+        incoming_timestamp_ns = (
+            int(message.timestamp.sec) * 1_000_000_000
+            + int(message.timestamp.nanosec)
         )
+        stored = self.amr_states.get(amr_id)
+        if (
+            stored is not None
+            and incoming_timestamp_ns <= stored.timestamp_ns
+        ):
+            self.get_logger().debug(
+                f"Ignored stale AMR status: {amr_id}"
+            )
+            return
+
+        if stored is None:
+            stored = AMRRuntimeState(
+                state="UNKNOWN",
+                status="",
+                current_task_id="",
+                load_state="UNKNOWN",
+            )
+            self.amr_states[amr_id] = stored
+
+        stored.state = message.state
+        stored.status = message.event
+        stored.current_task_id = message.task_id
+        stored.load_state = message.load_state
+        stored.kit_id = message.kit_id
+        stored.x = float(message.x)
+        stored.y = float(message.y)
+        stored.timestamp_ns = incoming_timestamp_ns
 
 
         self.get_logger().info(
@@ -581,14 +616,21 @@ class Scenario0FMSNode(Node):
         # Request 자체를 AMR 최신 상태로 반영
         # =================================================
 
-        self.amr_states[request.amr_id] = AMRRuntimeState(
-            state=request.state,
-            status="REQUESTING_TASK",
-            current_task_id=request.current_task_id,
-            load_state=request.load_state,
-            x=float(request.x),
-            y=float(request.y),
-        )
+        stored_state = self.amr_states.get(request.amr_id)
+        if stored_state is None:
+            stored_state = AMRRuntimeState(
+                state=request.state,
+                status="REQUESTING_TASK",
+                current_task_id=request.current_task_id,
+                load_state=request.load_state,
+            )
+            self.amr_states[request.amr_id] = stored_state
+        stored_state.state = request.state
+        stored_state.status = "REQUESTING_TASK"
+        stored_state.current_task_id = request.current_task_id
+        stored_state.load_state = request.load_state
+        stored_state.x = float(request.x)
+        stored_state.y = float(request.y)
 
 
         # =================================================
@@ -815,42 +857,11 @@ class Scenario0FMSNode(Node):
             )
 
 
-            # =============================================
-            # Pickup
-            # =============================================
-
-            response.pickup_id = (
-                pickup_location.location_id
-            )
-
-
-            response.pickup_x = float(
-                pickup_location.x
-            )
-
-
-            response.pickup_y = float(
-                pickup_location.y
-            )
-
-
-            # =============================================
-            # Delivery
-            # =============================================
-
-            response.delivery_id = (
-                delivery_location.location_id
-            )
-
-
-            response.delivery_x = float(
-                delivery_location.x
-            )
-
-
-            response.delivery_y = float(
-                delivery_location.y
-            )
+            # The list order is the AMR execution order.
+            response.destinations = [
+                self.to_location_message(pickup_location),
+                self.to_location_message(delivery_location),
+            ]
 
 
             response.message = (
@@ -889,15 +900,14 @@ class Scenario0FMSNode(Node):
             # FMS AMR 상태 갱신
             # =============================================
 
-            self.amr_states[request.amr_id] = AMRRuntimeState(
-                state="BUSY",
-                status="TASK_ASSIGNED",
-                current_task_id=selected_task.task_id,
-                load_state=request.load_state,
-                kit_id=selected_task.kit_id,
-                x=float(request.x),
-                y=float(request.y),
-            )
+            stored_state = self.amr_states[request.amr_id]
+            stored_state.state = "BUSY"
+            stored_state.status = "TASK_ASSIGNED"
+            stored_state.current_task_id = selected_task.task_id
+            stored_state.load_state = request.load_state
+            stored_state.kit_id = selected_task.kit_id
+            stored_state.x = float(request.x)
+            stored_state.y = float(request.y)
 
 
             self.get_logger().info(
@@ -909,7 +919,7 @@ class Scenario0FMSNode(Node):
 
             self.get_logger().info(
                 f"Pickup   : "
-                f"{pickup_location.location_id} "
+                f"{pickup_location.name} "
                 f"({pickup_location.x:.2f}, "
                 f"{pickup_location.y:.2f})"
             )
@@ -917,7 +927,7 @@ class Scenario0FMSNode(Node):
 
             self.get_logger().info(
                 f"Delivery : "
-                f"{delivery_location.location_id} "
+                f"{delivery_location.name} "
                 f"({delivery_location.x:.2f}, "
                 f"{delivery_location.y:.2f})"
             )

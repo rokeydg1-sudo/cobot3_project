@@ -11,10 +11,5 @@ bool has_task
 string task_id
 string kit_id
 float64 processing_time
-string pickup_id
-float64 pickup_x
-float64 pickup_y
-string delivery_id
-float64 delivery_x
-float64 delivery_y
+interfaces/Location[] destinations
 string message

@@ -2,18 +2,19 @@
 
 from dataclasses import dataclass
 
+from interfaces.msg import Location as LocationMessage
+
 
 # =========================================================
 # Location
 #
 # FMS가 소유하는 물리 위치 정보
 # cuOpt는 논리 위치만 반환하고,
-# FMS가 delivery_cell / pickup_id를 실제 좌표로 변환할 때 사용
+# FMS가 논리 위치 ID를 실제 좌표로 변환할 때 사용
 # =========================================================
 
 @dataclass(frozen=True)
 class Location:
-    location_id: str
     name: str
     x: float
     y: float
@@ -160,40 +161,35 @@ class OptimizationResult:
 # =========================================================
 
 AMR_START = Location(
-    location_id="amr_start",
-    name="AMR Start",
+    name=LocationMessage.AMR_START,
     x=0.0,
     y=0.0,
 )
 
 
 PARTS_SUPERMARKET = Location(
-    location_id="supermarket",
-    name="Parts Supermarket",
+    name=LocationMessage.PARTS_SUPERMARKET,
     x=-7.0,
     y=0.0,
 )
 
 
 ASSEMBLY_CELL_A = Location(
-    location_id="cell_a",
-    name="Assembly Cell A",
+    name=LocationMessage.ASSEMBLY_CELL_A,
     x=7.0,
     y=3.5,
 )
 
 
 ASSEMBLY_CELL_B = Location(
-    location_id="cell_b",
-    name="Assembly Cell B",
+    name=LocationMessage.ASSEMBLY_CELL_B,
     x=7.0,
     y=0.0,
 )
 
 
 ASSEMBLY_CELL_C = Location(
-    location_id="cell_c",
-    name="Assembly Cell C",
+    name=LocationMessage.ASSEMBLY_CELL_C,
     x=7.0,
     y=-3.5,
 )
@@ -209,8 +205,11 @@ LOCATIONS = (
 
 
 LOCATION_BY_ID = {
-    location.location_id: location
-    for location in LOCATIONS
+    "amr_start": AMR_START,
+    "supermarket": PARTS_SUPERMARKET,
+    "cell_a": ASSEMBLY_CELL_A,
+    "cell_b": ASSEMBLY_CELL_B,
+    "cell_c": ASSEMBLY_CELL_C,
 }
 
 

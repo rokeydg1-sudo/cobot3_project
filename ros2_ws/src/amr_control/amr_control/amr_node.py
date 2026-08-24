@@ -1,10 +1,11 @@
+import math
 import threading
 import time
 
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
-from interfaces.msg import AMRStatus
+from interfaces.msg import AMRStatus, Location
 from interfaces.srv import RequestTask
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
@@ -17,11 +18,14 @@ from rclpy.parameter import Parameter
 
 NAV2_ACTION_NAME = "/navigate_to_pose"
 NAV2_FRAME_ID = "map"
-NAV2_SERVER_TIMEOUT_SEC = 10.0
 NAV2_RESULT_TIMEOUT_SEC = 120.0
 TASK_REQUEST_INTERVAL_SEC = 1.0
-STATUS_UPDATE_INTERVAL_SEC = 1.0
 LOADING_TIME_SEC = 2.0
+ASSEMBLY_LOCATIONS = {
+    Location.ASSEMBLY_CELL_A,
+    Location.ASSEMBLY_CELL_B,
+    Location.ASSEMBLY_CELL_C,
+}
 
 
 class AMRNode(Node):
@@ -38,9 +42,14 @@ class AMRNode(Node):
         self.current_kit_id = ""
         self.task_request_pending = False
         self.task_running = False
+        self.destinations = []
+        self.destination_index = 0
+        self.navigation_token = 0
+        self.navigation_timeout_timer = None
+        self.loading_timer = None
 
         self.pose_lock = threading.Lock()
-        self.task_lock = threading.Lock()
+        self.task_lock = threading.RLock()
         self.latest_xy = None
         self.isaac_state_received = False
 
@@ -80,12 +89,6 @@ class AMRNode(Node):
             self.try_request_task,
             callback_group=self.timer_group,
         )
-        self.status_update_timer = self.create_timer(
-            STATUS_UPDATE_INTERVAL_SEC,
-            self.publish_runtime_status,
-            callback_group=self.timer_group,
-        )
-
         self.get_logger().info("=================================")
         self.get_logger().info("AMR Node started")
         self.get_logger().info(f"AMR ID        : {self.amr_id}")
@@ -120,16 +123,19 @@ class AMRNode(Node):
     def publish_status(self, event):
         """Publish the latest AMR runtime state to FMS."""
         message = AMRStatus()
-        message.amr_id = self.amr_id
-        message.state = self.state
-        message.event = event
-        message.task_id = self.current_task_id
-        message.kit_id = self.current_kit_id
-        message.load_state = self.load_state
-
-        current_position = self.get_current_position()
-        if current_position is not None:
-            message.x, message.y = current_position
+        with self.task_lock:
+            message.amr_id = self.amr_id
+            message.state = self.state
+            message.event = event
+            message.task_id = self.current_task_id
+            message.kit_id = self.current_kit_id
+            message.load_state = self.load_state
+            current_position = self.get_current_position()
+            if current_position is not None:
+                message.x, message.y = current_position
+            packed_at_ns = time.time_ns()
+            message.timestamp.sec = packed_at_ns // 1_000_000_000
+            message.timestamp.nanosec = packed_at_ns % 1_000_000_000
 
         self.status_publisher.publish(message)
         self.get_logger().info(
@@ -142,12 +148,7 @@ class AMRNode(Node):
         """Change state and publish one state-change event."""
         with self.task_lock:
             self.state = state
-        self.publish_status(event or state)
-
-    def publish_runtime_status(self):
-        """Report the current Isaac pose while a mission is in progress."""
-        if self.isaac_state_received and self.task_running:
-            self.publish_status("POSITION_UPDATE")
+            self.publish_status(event or state)
 
     def try_request_task(self):
         """Ask FMS for work when this AMR can accept a mission."""
@@ -192,6 +193,9 @@ class AMRNode(Node):
         if not response.has_task:
             self.get_logger().info(f"[NO TASK] {response.message}")
             return
+        if not response.destinations:
+            self.get_logger().error("FMS returned a task without destinations")
+            return
 
         with self.task_lock:
             if self.task_running:
@@ -203,6 +207,8 @@ class AMRNode(Node):
             self.current_task_id = response.task_id
             self.current_kit_id = response.kit_id
             self.state = "BUSY"
+            self.destinations = list(response.destinations)
+            self.destination_index = 0
 
         self.get_logger().info("=================================")
         self.get_logger().info("NEW TASK RECEIVED")
@@ -211,58 +217,51 @@ class AMRNode(Node):
         self.get_logger().info(
             f"Processing Time : {response.processing_time:.1f}s"
         )
-        self.get_logger().info(
-            f"Pickup          : {response.pickup_id} "
-            f"({response.pickup_x:.2f}, {response.pickup_y:.2f})"
-        )
-        self.get_logger().info(
-            f"Delivery        : {response.delivery_id} "
-            f"({response.delivery_x:.2f}, {response.delivery_y:.2f})"
-        )
+        for index, destination in enumerate(response.destinations, start=1):
+            self.get_logger().info(
+                f"Destination {index:02d} : {destination.name} "
+                f"({destination.x:.2f}, {destination.y:.2f}, "
+                f"yaw={destination.yaw:.2f})"
+            )
         self.get_logger().info("=================================")
         self.publish_status("TASK_ASSIGNED")
+        self.start_next_destination()
 
-        threading.Thread(
-            target=self.execute_task, args=(response,), daemon=True
-        ).start()
+    def start_next_destination(self):
+        """Send the next destination without blocking an executor thread."""
+        with self.task_lock:
+            if not self.task_running:
+                return
+            if self.destination_index >= len(self.destinations):
+                destination = None
+            else:
+                destination = self.destinations[self.destination_index]
 
-    def execute_task(self, task):
-        """Execute the assigned pickup and delivery mission."""
-        try:
+        if destination is None:
+            self.complete_task()
+            return
+
+        location_name = destination.name
+        if location_name == Location.PARTS_SUPERMARKET:
             self.transition_to("MOVING_TO_PICKUP")
-            if not self.move_to_destination(
-                task.pickup_id, task.pickup_x, task.pickup_y
-            ):
-                self.handle_task_failure(f"Failed to move to {task.pickup_id}")
-                return
-
-            self.transition_to("ARRIVED_PICKUP")
-            self.publish_status("LOADING")
-            time.sleep(LOADING_TIME_SEC)
-            self.load_state = "LOADED"
-            self.transition_to("LOADED", "LOAD_COMPLETE")
-
+        elif location_name in ASSEMBLY_LOCATIONS:
             self.transition_to("MOVING_TO_DELIVERY")
-            if not self.move_to_destination(
-                task.delivery_id, task.delivery_x, task.delivery_y
-            ):
-                self.handle_task_failure(f"Failed to move to {task.delivery_id}")
-                return
+        else:
+            self.transition_to("NAVIGATING")
 
-            self.transition_to("ARRIVED_DELIVERY")
-            self.load_state = "EMPTY"
-            self.transition_to("DELIVERED", "DELIVERY_COMPLETE")
-            self.publish_status("MISSION_COMPLETE")
-            self.get_logger().info(f"[TASK COMPLETE] {self.current_task_id}")
+        self.send_navigation_goal(destination)
 
-            with self.task_lock:
-                self.current_task_id = ""
-                self.current_kit_id = ""
-                self.state = "IDLE"
-                self.task_running = False
-            self.publish_status("IDLE")
-        except Exception as error:
-            self.handle_task_failure(str(error))
+    def complete_task(self):
+        self.publish_status("MISSION_COMPLETE")
+        self.get_logger().info(f"[TASK COMPLETE] {self.current_task_id}")
+        with self.task_lock:
+            self.current_task_id = ""
+            self.current_kit_id = ""
+            self.destinations = []
+            self.destination_index = 0
+            self.state = "IDLE"
+            self.task_running = False
+        self.publish_status("IDLE")
 
     def handle_task_failure(self, message):
         """Move the AMR to ERROR and stop automatic task requests."""
@@ -272,29 +271,34 @@ class AMRNode(Node):
         self.publish_status("TASK_FAILED")
         self.get_logger().error(f"[TASK FAILED] {message}")
 
-    def create_pose(self, x, y):
+    def create_pose(self, destination):
         """Create a map-frame pose for a Nav2 navigation goal."""
         pose = PoseStamped()
         pose.header.frame_id = NAV2_FRAME_ID
         pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = float(x)
-        pose.pose.position.y = float(y)
-        pose.pose.orientation.w = 1.0
+        pose.pose.position.x = float(destination.x)
+        pose.pose.position.y = float(destination.y)
+        pose.pose.orientation.z = math.sin(float(destination.yaw) / 2.0)
+        pose.pose.orientation.w = math.cos(float(destination.yaw) / 2.0)
         return pose
 
-    def move_to_destination(self, destination_id, goal_x, goal_y):
-        """Send one FMS destination to Nav2 and wait for its result."""
-        if not self.nav2_client.wait_for_server(
-            timeout_sec=NAV2_SERVER_TIMEOUT_SEC
-        ):
+    def send_navigation_goal(self, destination):
+        """Send one destination and continue from asynchronous callbacks."""
+        destination_id = destination.name
+        if not self.nav2_client.server_is_ready():
             self.get_logger().error("Nav2 NavigateToPose server is unavailable")
-            return False
+            self.handle_task_failure(
+                f"Nav2 is unavailable for {destination_id}"
+            )
+            return
 
         goal = NavigateToPose.Goal()
-        goal.pose = self.create_pose(goal_x, goal_y)
+        goal.pose = self.create_pose(destination)
         goal.behavior_tree = ""
-        completed = threading.Event()
-        outcome = {}
+
+        with self.task_lock:
+            self.navigation_token += 1
+            token = self.navigation_token
 
         def feedback_callback(feedback_message):
             feedback = feedback_message.feedback
@@ -303,66 +307,143 @@ class AMRNode(Node):
                 f"remaining={feedback.distance_remaining:.2f}m"
             )
 
-        def result_callback(future):
-            try:
-                wrapped_result = future.result()
-                outcome["status"] = wrapped_result.status
-                outcome["result"] = wrapped_result.result
-            except Exception as error:
-                outcome["error"] = error
-            completed.set()
-
         def goal_callback(future):
+            if not self.is_current_navigation(token):
+                return
             try:
                 goal_handle = future.result()
                 if not goal_handle.accepted:
-                    outcome["error"] = RuntimeError(
+                    if not self.claim_navigation(token):
+                        return
+                    self.finish_navigation_timer()
+                    self.handle_task_failure(
                         f"Nav2 rejected goal: {destination_id}"
                     )
-                    completed.set()
                     return
-                goal_handle.get_result_async().add_done_callback(result_callback)
+                goal_handle.get_result_async().add_done_callback(
+                    lambda result_future: self.navigation_result_callback(
+                        result_future, destination, token
+                    )
+                )
             except Exception as error:
-                outcome["error"] = error
-                completed.set()
+                if not self.claim_navigation(token):
+                    return
+                self.finish_navigation_timer()
+                self.handle_task_failure(str(error))
 
         self.get_logger().info(
             f"Sending NavigateToPose goal: {destination_id} "
-            f"({goal_x:.2f}, {goal_y:.2f})"
+            f"({destination.x:.2f}, {destination.y:.2f}, "
+            f"yaw={destination.yaw:.2f})"
+        )
+        self.finish_navigation_timer()
+        self.navigation_timeout_timer = self.create_timer(
+            NAV2_RESULT_TIMEOUT_SEC,
+            lambda: self.navigation_timeout_callback(destination_id, token),
+            callback_group=self.timer_group,
         )
         self.nav2_client.send_goal_async(
             goal, feedback_callback=feedback_callback
         ).add_done_callback(goal_callback)
 
-        if not completed.wait(NAV2_RESULT_TIMEOUT_SEC):
-            self.get_logger().error(
-                f"Timed out while navigating to {destination_id}"
-            )
-            return False
-        if "error" in outcome:
-            self.get_logger().error(f"Nav2 navigation failed: {outcome['error']}")
-            return False
+    def is_current_navigation(self, token):
+        with self.task_lock:
+            return self.task_running and token == self.navigation_token
 
-        result = outcome["result"]
+    def claim_navigation(self, token):
+        """Allow only one result or timeout callback to finish this goal."""
+        with self.task_lock:
+            if not self.task_running or token != self.navigation_token:
+                return False
+            self.navigation_token += 1
+            return True
+
+    def finish_navigation_timer(self):
+        if self.navigation_timeout_timer is not None:
+            self.navigation_timeout_timer.cancel()
+            self.destroy_timer(self.navigation_timeout_timer)
+            self.navigation_timeout_timer = None
+
+    def navigation_timeout_callback(self, destination_id, token):
+        if not self.claim_navigation(token):
+            return
+        self.finish_navigation_timer()
+        self.handle_task_failure(
+            f"Timed out while navigating to {destination_id}"
+        )
+
+    def navigation_result_callback(self, future, destination, token):
+        if not self.claim_navigation(token):
+            return
+        self.finish_navigation_timer()
+
+        try:
+            wrapped_result = future.result()
+        except Exception as error:
+            self.handle_task_failure(str(error))
+            return
+
+        result = wrapped_result.result
         if (
-            outcome["status"] != GoalStatus.STATUS_SUCCEEDED
+            wrapped_result.status != GoalStatus.STATUS_SUCCEEDED
             or result.error_code != NavigateToPose.Result.NONE
         ):
-            self.get_logger().error(
-                f"Nav2 navigation failed: status={outcome['status']}, "
+            self.handle_task_failure(
+                f"Nav2 navigation failed: status={wrapped_result.status}, "
                 f"code={result.error_code}, message={result.error_msg}"
             )
-            return False
+            return
 
-        self.get_logger().info(f"Nav2 reached destination: {destination_id}")
-        return True
+        self.get_logger().info(
+            f"Nav2 reached destination: {destination.name}"
+        )
+        self.handle_destination_arrival(destination)
+
+    def handle_destination_arrival(self, destination):
+        location_name = destination.name
+        if location_name == Location.PARTS_SUPERMARKET:
+            self.transition_to("ARRIVED_PICKUP")
+            self.publish_status("LOADING")
+            self.finish_loading_timer()
+            self.loading_timer = self.create_timer(
+                LOADING_TIME_SEC,
+                self.loading_complete_callback,
+                callback_group=self.timer_group,
+            )
+            return
+
+        if location_name in ASSEMBLY_LOCATIONS:
+            with self.task_lock:
+                self.load_state = "EMPTY"
+            self.transition_to("DELIVERED", "DELIVERY_COMPLETE")
+        else:
+            self.transition_to("ARRIVED", f"ARRIVED_{location_name}")
+        self.advance_destination()
+
+    def finish_loading_timer(self):
+        if self.loading_timer is not None:
+            self.loading_timer.cancel()
+            self.destroy_timer(self.loading_timer)
+            self.loading_timer = None
+
+    def loading_complete_callback(self):
+        self.finish_loading_timer()
+        with self.task_lock:
+            self.load_state = "LOADED"
+        self.transition_to("LOADED", "LOAD_COMPLETE")
+        self.advance_destination()
+
+    def advance_destination(self):
+        with self.task_lock:
+            self.destination_index += 1
+        self.start_next_destination()
 
 
 def main(args=None):
     rclpy.init(args=args)
     amr_id = "AMR_01"
     node = AMRNode(amr_id)
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
 
     try:

@@ -1,10 +1,11 @@
+import math
 import threading
 import time
 
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
-from interfaces.msg import AMRStatus
+from interfaces.msg import AMRStatus, Location
 from interfaces.srv import RequestTask
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
@@ -21,6 +22,11 @@ NAV2_SERVER_TIMEOUT_SEC = 10.0
 NAV2_RESULT_TIMEOUT_SEC = 120.0
 TASK_REQUEST_INTERVAL_SEC = 1.0
 LOADING_TIME_SEC = 2.0
+ASSEMBLY_LOCATIONS = {
+    Location.ASSEMBLY_CELL_A,
+    Location.ASSEMBLY_CELL_B,
+    Location.ASSEMBLY_CELL_C,
+}
 
 
 class AMRNav2Node(Node):
@@ -122,6 +128,9 @@ class AMRNav2Node(Node):
         current_position = self.get_current_position()
         if current_position is not None:
             message.x, message.y = current_position
+        packed_at_ns = time.time_ns()
+        message.timestamp.sec = packed_at_ns // 1_000_000_000
+        message.timestamp.nanosec = packed_at_ns % 1_000_000_000
 
         self.status_publisher.publish(message)
         self.get_logger().info(
@@ -176,6 +185,9 @@ class AMRNav2Node(Node):
         if not response.has_task:
             self.get_logger().info(f"[NO TASK] {response.message}")
             return
+        if not response.destinations:
+            self.get_logger().error("FMS returned a task without destinations")
+            return
 
         with self.task_lock:
             if self.task_running:
@@ -192,14 +204,12 @@ class AMRNav2Node(Node):
         self.get_logger().info("NEW TASK RECEIVED")
         self.get_logger().info(f"Task ID  : {response.task_id}")
         self.get_logger().info(f"Kit ID   : {response.kit_id}")
-        self.get_logger().info(
-            f"Pickup   : {response.pickup_id} "
-            f"({response.pickup_x:.2f}, {response.pickup_y:.2f})"
-        )
-        self.get_logger().info(
-            f"Delivery : {response.delivery_id} "
-            f"({response.delivery_x:.2f}, {response.delivery_y:.2f})"
-        )
+        for index, destination in enumerate(response.destinations, start=1):
+            self.get_logger().info(
+                f"Destination {index:02d}: {destination.name} "
+                f"({destination.x:.2f}, {destination.y:.2f}, "
+                f"yaw={destination.yaw:.2f})"
+            )
         self.get_logger().info("=================================")
         self.publish_status("TASK_ASSIGNED")
 
@@ -209,29 +219,37 @@ class AMRNav2Node(Node):
 
     def execute_task(self, task):
         try:
-            self.transition_to("MOVING_TO_PICKUP")
-            if not self.move_to_destination(
-                task.pickup_id, task.pickup_x, task.pickup_y
-            ):
-                self.handle_task_failure(f"Failed to move to {task.pickup_id}")
-                return
+            for destination in task.destinations:
+                location_name = destination.name
 
-            self.transition_to("ARRIVED_PICKUP")
-            self.publish_status("LOADING")
-            time.sleep(LOADING_TIME_SEC)
-            self.load_state = "LOADED"
-            self.transition_to("LOADED", "LOAD_COMPLETE")
+                if location_name == Location.PARTS_SUPERMARKET:
+                    self.transition_to("MOVING_TO_PICKUP")
+                elif location_name in ASSEMBLY_LOCATIONS:
+                    self.transition_to("MOVING_TO_DELIVERY")
+                else:
+                    self.transition_to("NAVIGATING")
 
-            self.transition_to("MOVING_TO_DELIVERY")
-            if not self.move_to_destination(
-                task.delivery_id, task.delivery_x, task.delivery_y
-            ):
-                self.handle_task_failure(f"Failed to move to {task.delivery_id}")
-                return
+                if not self.move_to_destination(destination):
+                    self.handle_task_failure(
+                        f"Failed to move to {location_name}"
+                    )
+                    return
 
-            self.publish_status("ARRIVED_DELIVERY")
-            self.load_state = "EMPTY"
-            self.transition_to("DELIVERED", "DELIVERY_COMPLETE")
+                if location_name == Location.PARTS_SUPERMARKET:
+                    self.transition_to("ARRIVED_PICKUP")
+                    self.publish_status("LOADING")
+                    time.sleep(LOADING_TIME_SEC)
+                    self.load_state = "LOADED"
+                    self.transition_to("LOADED", "LOAD_COMPLETE")
+                elif location_name in ASSEMBLY_LOCATIONS:
+                    self.transition_to("ARRIVED_DELIVERY")
+                    self.load_state = "EMPTY"
+                    self.transition_to("DELIVERED", "DELIVERY_COMPLETE")
+                else:
+                    self.transition_to(
+                        "ARRIVED", f"ARRIVED_{location_name}"
+                    )
+
             self.publish_status("MISSION_COMPLETE")
 
             with self.task_lock:
@@ -250,8 +268,9 @@ class AMRNav2Node(Node):
         self.publish_status("TASK_FAILED")
         self.get_logger().error(f"[TASK FAILED] {message}")
 
-    def move_to_destination(self, destination_id, goal_x, goal_y):
+    def move_to_destination(self, destination):
         """Send one physical FMS destination to Nav2 and await its result."""
+        destination_id = destination.name
         if not self.nav2_client.wait_for_server(
             timeout_sec=NAV2_SERVER_TIMEOUT_SEC
         ):
@@ -259,7 +278,7 @@ class AMRNav2Node(Node):
             return False
 
         goal = NavigateToPose.Goal()
-        goal.pose = self.create_pose(goal_x, goal_y)
+        goal.pose = self.create_pose(destination)
         goal.behavior_tree = ""
         completed = threading.Event()
         outcome = {}
@@ -296,7 +315,8 @@ class AMRNav2Node(Node):
 
         self.get_logger().info(
             f"Sending NavigateToPose goal: {destination_id} "
-            f"({goal_x:.2f}, {goal_y:.2f})"
+            f"({destination.x:.2f}, {destination.y:.2f}, "
+            f"yaw={destination.yaw:.2f})"
         )
         self.nav2_client.send_goal_async(
             goal, feedback_callback=feedback_callback
@@ -325,13 +345,14 @@ class AMRNav2Node(Node):
         self.get_logger().info(f"Nav2 reached destination: {destination_id}")
         return True
 
-    def create_pose(self, x, y):
+    def create_pose(self, destination):
         pose = PoseStamped()
         pose.header.frame_id = NAV2_FRAME_ID
         pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = float(x)
-        pose.pose.position.y = float(y)
-        pose.pose.orientation.w = 1.0
+        pose.pose.position.x = float(destination.x)
+        pose.pose.position.y = float(destination.y)
+        pose.pose.orientation.z = math.sin(float(destination.yaw) / 2.0)
+        pose.pose.orientation.w = math.cos(float(destination.yaw) / 2.0)
         return pose
 
 
